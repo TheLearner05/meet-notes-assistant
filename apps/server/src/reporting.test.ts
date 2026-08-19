@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { calculateSpeakerStats, parseMeetingReport } from './reporting.js';
+import { calculateSpeakerStats, parseMeetingReport, transcriptDateTime } from './reporting.js';
 
 describe('calculateSpeakerStats', () => {
   it('adds speaking time by speaker label', () => {
@@ -33,5 +33,12 @@ describe('parseMeetingReport', () => {
     const report = parseMeetingReport('{"summary":"Partially', []);
 
     expect(report.summary).toBe('The transcript was saved, but an AI summary was unavailable.');
+  });
+});
+
+describe('transcriptDateTime', () => {
+  it('adds the segment offset to the real recording start time', () => {
+    expect(transcriptDateTime('2026-08-20T04:30:00.000Z', 65).toISOString())
+      .toBe('2026-08-20T04:31:05.000Z');
   });
 });

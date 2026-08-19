@@ -10,6 +10,16 @@ export function calculateSpeakerStats(segments: TranscriptSegment[]): { speakerL
   return [...totals.entries()].map(([speakerLabel, talkSeconds]) => ({ speakerLabel, talkSeconds })).sort((a, b) => b.talkSeconds - a.talkSeconds);
 }
 
+export function transcriptDateTime(recordingStartedAt: string, segmentStartSeconds: number): Date {
+  const recordingStart = new Date(recordingStartedAt);
+  if (Number.isNaN(recordingStart.getTime())) throw new Error('Meeting start time is invalid');
+  return new Date(recordingStart.getTime() + Math.max(0, segmentStartSeconds) * 1000);
+}
+
+function formatTranscriptDateTime(recordingStartedAt: string, segmentStartSeconds: number): string {
+  return transcriptDateTime(recordingStartedAt, segmentStartSeconds).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
+}
+
 export function parseMeetingReport(content: string | null | undefined, transcript: TranscriptSegment[]): MeetingReport {
   const fallback: MeetingReport = {
     summary: 'The transcript was saved, but an AI summary was unavailable.',
@@ -41,7 +51,7 @@ export function reportAsMarkdown(meeting: MeetingRecord): string {
   const report = meeting.report;
   if (!report) return '# Meeting report\n\nThe report is not ready yet.';
   const actions = report.actionItems.map((item) => `- ${item.text}${item.ownerSpeakerLabel ? ` — ${item.ownerSpeakerLabel}` : ''}${item.dueDate ? ` (due ${item.dueDate})` : ''}`).join('\n') || '- None stated';
-  const transcript = meeting.transcript.map((item) => `**${item.speakerLabel}** [${formatTime(item.startSeconds)}] ${item.text}`).join('\n\n');
+  const transcript = meeting.transcript.map((item) => `**${item.speakerLabel}** [${formatTranscriptDateTime(meeting.createdAt, item.startSeconds)}] ${item.text}`).join('\n\n');
   return `# Meeting report\n\n## Summary\n${report.summary}\n\n## Decisions\n${report.decisions.map((item) => `- ${item}`).join('\n') || '- None stated'}\n\n## Action items\n${actions}\n\n## Open questions\n${report.openQuestions.map((item) => `- ${item}`).join('\n') || '- None stated'}\n\n## Speaker report\n${report.speakerStats.map((item) => `- ${item.speakerLabel}: ${Math.round(item.talkSeconds)} seconds`).join('\n')}\n\n## Transcript\n${transcript}`;
 }
 
