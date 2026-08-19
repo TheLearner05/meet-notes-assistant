@@ -51,8 +51,15 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
 
   const finishMatch = path.match(/^\/api\/meetings\/([a-z0-9-]+)\/finish$/i);
   if (request.method === 'POST' && finishMatch) {
-    const meeting = await store.update(finishMatch[1], (item) => { item.status = 'processing'; item.endedAt = new Date().toISOString(); });
-    void processMeeting(store, meeting.id, dataRoot).catch(async (error) => store.update(meeting.id, (item) => { item.status = 'failed'; item.error = error instanceof Error ? error.message : 'Processing failed'; }));
+    const meeting = await queueProcessing(finishMatch[1]);
+    sendJson(response, 202, { id: meeting.id, status: 'processing' }); return;
+  }
+
+  const retryMatch = path.match(/^\/api\/meetings\/([a-z0-9-]+)\/retry$/i);
+  if (request.method === 'POST' && retryMatch) {
+    const existing = await requireMeeting(retryMatch[1]);
+    if (existing.status !== 'failed') throw new Error('Only failed meetings can be retried');
+    const meeting = await queueProcessing(existing.id);
     sendJson(response, 202, { id: meeting.id, status: 'processing' }); return;
   }
 
@@ -90,6 +97,11 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
 }
 
 async function requireMeeting(id: string) { const meeting = await store.get(id); if (!meeting) throw new Error('Meeting not found'); return meeting; }
+async function queueProcessing(id: string) {
+  const meeting = await store.update(id, (item) => { item.status = 'processing'; item.error = undefined; item.endedAt = new Date().toISOString(); });
+  void processMeeting(store, meeting.id, dataRoot).catch(async (error) => store.update(meeting.id, (item) => { item.status = 'failed'; item.error = error instanceof Error ? error.message : 'Processing failed'; }));
+  return meeting;
+}
 function setCors(response: ServerResponse) { response.setHeader('Access-Control-Allow-Origin', '*'); response.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS'); response.setHeader('Access-Control-Allow-Headers', 'Content-Type'); }
 function sendJson(response: ServerResponse, status: number, data: unknown) { response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); response.end(JSON.stringify(data)); }
 async function readBody(request: IncomingMessage): Promise<Buffer> { const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); return Buffer.concat(chunks); }

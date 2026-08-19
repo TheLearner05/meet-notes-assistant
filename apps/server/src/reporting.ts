@@ -10,6 +10,33 @@ export function calculateSpeakerStats(segments: TranscriptSegment[]): { speakerL
   return [...totals.entries()].map(([speakerLabel, talkSeconds]) => ({ speakerLabel, talkSeconds })).sort((a, b) => b.talkSeconds - a.talkSeconds);
 }
 
+export function parseMeetingReport(content: string | null | undefined, transcript: TranscriptSegment[]): MeetingReport {
+  const fallback: MeetingReport = {
+    summary: 'The transcript was saved, but an AI summary was unavailable.',
+    decisions: [],
+    actionItems: [],
+    openQuestions: [],
+    speakerStats: calculateSpeakerStats(transcript),
+  };
+
+  if (!content?.trim()) return fallback;
+
+  try {
+    const parsed = JSON.parse(content) as Partial<Omit<MeetingReport, 'speakerStats'>>;
+    return {
+      summary: typeof parsed.summary === 'string' && parsed.summary.trim() ? parsed.summary : fallback.summary,
+      decisions: Array.isArray(parsed.decisions) ? parsed.decisions.filter((item): item is string => typeof item === 'string') : [],
+      actionItems: Array.isArray(parsed.actionItems)
+        ? parsed.actionItems.filter((item): item is MeetingReport['actionItems'][number] => Boolean(item) && typeof item === 'object' && typeof item.text === 'string')
+        : [],
+      openQuestions: Array.isArray(parsed.openQuestions) ? parsed.openQuestions.filter((item): item is string => typeof item === 'string') : [],
+      speakerStats: fallback.speakerStats,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 export function reportAsMarkdown(meeting: MeetingRecord): string {
   const report = meeting.report;
   if (!report) return '# Meeting report\n\nThe report is not ready yet.';
@@ -43,20 +70,18 @@ export async function processMeeting(store: MeetingStore, meetingId: string, dat
       endSeconds: segment.end ?? 0,
       text: segment.text ?? '',
     }));
+    if (!transcript.length && transcription.text?.trim()) {
+      transcript.push({ speakerLabel: 'Speaker A', startSeconds: 0, endSeconds: 0, text: transcription.text.trim() });
+    }
+    if (!transcript.length) throw new Error('The recording did not contain transcribable speech.');
+    await store.update(meetingId, (item) => { item.transcript = transcript; });
     const transcriptText = transcript.map((segment) => `${segment.speakerLabel} [${formatTime(segment.startSeconds)}]: ${segment.text}`).join('\n');
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_SUMMARY_MODEL ?? 'gpt-4.1-mini',
       response_format: { type: 'json_object' },
       messages: [{ role: 'system', content: 'Create an accurate English meeting report from the transcript. Return JSON with summary (string), decisions (string[]), actionItems ({text, ownerSpeakerLabel?, dueDate?}[]), and openQuestions (string[]). Do not invent decisions, owners, or due dates; use null for unknown due dates.' }, { role: 'user', content: transcriptText }],
     });
-    const parsed = JSON.parse(completion.choices[0]?.message.content ?? '{}') as Omit<MeetingReport, 'speakerStats'>;
-    const report: MeetingReport = {
-      summary: typeof parsed.summary === 'string' ? parsed.summary : 'No summary could be generated.',
-      decisions: Array.isArray(parsed.decisions) ? parsed.decisions : [],
-      actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems : [],
-      openQuestions: Array.isArray(parsed.openQuestions) ? parsed.openQuestions : [],
-      speakerStats: calculateSpeakerStats(transcript),
-    };
+    const report = parseMeetingReport(completion.choices[0]?.message.content, transcript);
     await store.update(meetingId, (item) => { item.transcript = transcript; item.report = report; item.status = 'ready'; });
   } catch (error) {
     await store.update(meetingId, (item) => { item.status = 'failed'; item.error = error instanceof Error ? error.message : 'Processing failed'; });
