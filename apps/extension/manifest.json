@@ -3,10 +3,11 @@
   "name": "Meet Notes Assistant",
   "description": "Consent-first meeting recording and notes for Google Meet.",
   "version": "0.0.1",
-  "permissions": ["activeTab", "storage", "tabCapture", "offscreen"],
+  "permissions": ["activeTab", "storage", "tabCapture", "offscreen", "tabs"],
   "host_permissions": ["https://meet.google.com/*"],
   "action": {
-    "default_title": "Meet Notes Assistant"
+    "default_title": "Meet Notes Assistant",
+    "default_popup": "popup.html"
   },
   "background": {
     "service_worker": "background.js",
