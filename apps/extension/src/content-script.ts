@@ -1,17 +1,35 @@
 import { getMeetState } from './content/meet-detector.js';
-import { shouldShowRecordingPrompt } from './content/recording-prompt.js';
+import { shouldAutoStopRecording, shouldShowRecordingPrompt } from './content/recording-prompt.js';
 
 let isRecording = false;
 let prompt: HTMLDivElement | undefined;
+let autoStopTimer: number | undefined;
+const AUTO_STOP_GRACE_MS = 4000;
 
 function render(): void {
   const state = getMeetState(location.href, document);
+  updateAutoStop(state);
   if (!shouldShowRecordingPrompt(state, isRecording)) { prompt?.remove(); prompt = undefined; return; }
   if (prompt) return;
   prompt = document.createElement('div');
   prompt.id = 'meet-notes-assistant-prompt';
   prompt.innerHTML = `<div style="font:14px system-ui,sans-serif;position:fixed;z-index:2147483647;right:20px;bottom:20px;width:280px;padding:16px;background:white;color:#172033;border-radius:12px;box-shadow:0 8px 28px #0004"><strong>Meeting detected</strong><p style="margin:8px 0">Confirm that everyone knows this meeting is being recorded, then click the <strong>Meet Notes Assistant</strong> icon in Chrome's toolbar to start.</p></div>`;
   document.documentElement.append(prompt);
+}
+
+function updateAutoStop(state: ReturnType<typeof getMeetState>): void {
+  if (!shouldAutoStopRecording(state, isRecording)) {
+    if (autoStopTimer !== undefined) window.clearTimeout(autoStopTimer);
+    autoStopTimer = undefined;
+    return;
+  }
+  if (autoStopTimer !== undefined) return;
+  autoStopTimer = window.setTimeout(() => {
+    autoStopTimer = undefined;
+    if (shouldAutoStopRecording(getMeetState(location.href, document), isRecording)) {
+      chrome.runtime.sendMessage({ type: 'MEETING_ENDED' });
+    }
+  }, AUTO_STOP_GRACE_MS);
 }
 
 function showRecordingBanner(): void {
@@ -23,7 +41,7 @@ function showRecordingBanner(): void {
 }
 
 chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'RECORDING_STARTED') { isRecording = true; prompt?.remove(); prompt = undefined; showRecordingBanner(); }
+  if (message.type === 'RECORDING_STARTED') { isRecording = true; prompt?.remove(); prompt = undefined; showRecordingBanner(); render(); }
   if (message.type === 'RECORDING_STOPPED') { isRecording = false; document.querySelector('#meet-notes-assistant-recording')?.remove(); render(); }
 });
 
