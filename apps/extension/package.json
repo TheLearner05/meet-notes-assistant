@@ -4,11 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/build.mjs",
-    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json --noEmit && node scripts/build.mjs",
+    "test": "pnpm build && vitest run",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/chrome": "^0.1.30"
+    "@types/chrome": "^0.1.30",
+    "@types/node": "^24.10.1",
+    "esbuild": "^0.28.2"
   }
 }
