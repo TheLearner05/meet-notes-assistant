@@ -29,7 +29,7 @@
 3. Select **Load unpacked**.
 4. Select this folder:
 
-   `C:\Users\jayhe\Documents\Codex\2026-08-19\we-x20\apps\extension\dist`
+   `C:\Users\jayhe\OneDrive\Desktop\projects\gmeet-recorder\apps\extension\dist`
 
 5. Pin **Meet Notes Assistant** from the Chrome extensions menu.
 
