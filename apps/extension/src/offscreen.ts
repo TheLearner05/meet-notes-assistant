@@ -1,9 +1,12 @@
 import { BACKEND_URL } from './config.js';
+import { preserveLocalPlayback } from './offscreen-playback.js';
 
 let recorder: MediaRecorder | undefined;
 let meetingId: string | undefined;
 let sequence = 0;
 const pending: Blob[] = [];
+let playbackContext: AudioContext | undefined;
+let capturedStream: MediaStream | undefined;
 
 async function upload(blob: Blob): Promise<void> {
   if (!meetingId) return;
@@ -19,6 +22,8 @@ chrome.runtime.onMessage.addListener((message) => {
 async function start(id: string, streamId: string): Promise<void> {
   meetingId = id; sequence = 0;
   const stream = await navigator.mediaDevices.getUserMedia({ audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } } } as unknown as MediaStreamConstraints);
+  capturedStream = stream;
+  playbackContext = preserveLocalPlayback(stream);
   recorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
   recorder.addEventListener('dataavailable', (event) => { if (event.data.size) void upload(event.data).catch(() => pending.push(event.data)); });
   recorder.start(30000);
@@ -30,5 +35,8 @@ async function stop(): Promise<void> {
   await new Promise<void>((resolve) => { recorder?.addEventListener('stop', () => resolve(), { once: true }); recorder?.stop(); });
   for (const blob of pending.splice(0)) await upload(blob);
   await fetch(`${BACKEND_URL}/api/meetings/${id}/finish`, { method: 'POST' });
+  capturedStream?.getTracks().forEach((track) => track.stop());
+  await playbackContext?.close();
+  capturedStream = undefined; playbackContext = undefined;
   recorder = undefined; meetingId = undefined;
 }
