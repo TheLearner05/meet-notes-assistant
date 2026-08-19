@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/build.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

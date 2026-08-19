@@ -1,0 +1,34 @@
+import { BACKEND_URL } from './config.js';
+
+let recorder: MediaRecorder | undefined;
+let meetingId: string | undefined;
+let sequence = 0;
+const pending: Blob[] = [];
+
+async function upload(blob: Blob): Promise<void> {
+  if (!meetingId) return;
+  const response = await fetch(`${BACKEND_URL}/api/meetings/${meetingId}/chunks/${sequence++}`, { method: 'PUT', headers: { 'Content-Type': 'audio/webm' }, body: blob });
+  if (!response.ok) throw new Error('Chunk upload failed');
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === 'OFFSCREEN_START') void start(message.meetingId, message.streamId);
+  if (message.type === 'OFFSCREEN_STOP') void stop();
+});
+
+async function start(id: string, streamId: string): Promise<void> {
+  meetingId = id; sequence = 0;
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } } } as unknown as MediaStreamConstraints);
+  recorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+  recorder.addEventListener('dataavailable', (event) => { if (event.data.size) void upload(event.data).catch(() => pending.push(event.data)); });
+  recorder.start(30000);
+}
+
+async function stop(): Promise<void> {
+  if (!recorder || !meetingId) return;
+  const id = meetingId;
+  await new Promise<void>((resolve) => { recorder?.addEventListener('stop', () => resolve(), { once: true }); recorder?.stop(); });
+  for (const blob of pending.splice(0)) await upload(blob);
+  await fetch(`${BACKEND_URL}/api/meetings/${id}/finish`, { method: 'POST' });
+  recorder = undefined; meetingId = undefined;
+}

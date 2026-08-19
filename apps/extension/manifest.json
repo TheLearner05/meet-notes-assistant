@@ -9,13 +9,13 @@
     "default_title": "Meet Notes Assistant"
   },
   "background": {
-    "service_worker": "src/background.ts",
+    "service_worker": "background.js",
     "type": "module"
   },
   "content_scripts": [
     {
       "matches": ["https://meet.google.com/*"],
-      "js": ["src/content-script.ts"],
+      "js": ["content-script.js"],
       "run_at": "document_idle"
     }
   ]
