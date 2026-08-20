@@ -1,16 +1,27 @@
-import { CaptureController } from './background/capture-controller.js';
+import { CaptureController, createOffscreenDocumentEnsurer } from './background/capture-controller.js';
 import { isCapturableMeetTab, shouldStopRecordingForNavigation } from './background/tab-validation.js';
 import { BACKEND_URL } from './config.js';
 
 const streamIds = new Map<number, string>();
-let offscreenReady = false;
 let recordingTabId: number | undefined;
+const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
+const ensureOffscreenDocument = createOffscreenDocumentEnsurer({
+  async hasOffscreenDocument() {
+    const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
+    const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'], documentUrls: [offscreenUrl] });
+    return contexts.length > 0;
+  },
+  createOffscreenDocument() {
+    return chrome.offscreen.createDocument({
+      url: OFFSCREEN_DOCUMENT_PATH,
+      reasons: [chrome.offscreen.Reason.USER_MEDIA],
+      justification: 'Capture Google Meet audio after the user explicitly starts recording.',
+    });
+  },
+});
 const controller = new CaptureController({
+  ensureOffscreenDocument,
   async startTabAudio(tabId) {
-    if (!offscreenReady) {
-      await chrome.offscreen.createDocument({ url: 'offscreen.html', reasons: [chrome.offscreen.Reason.USER_MEDIA], justification: 'Capture Google Meet audio after the user explicitly starts recording.' });
-      offscreenReady = true;
-    }
     streamIds.set(tabId, await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }));
   },
 });
