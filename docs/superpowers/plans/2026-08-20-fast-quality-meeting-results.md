@@ -23,6 +23,8 @@
 
 ### Task 1: Make meeting processing state explicit and race-safe
 
+**Status: complete** (commit `23f3daf`)
+
 **Files:**
 - Modify: `apps/server/src/meeting-store.ts`
 - Modify: `apps/server/src/meeting-store.test.ts`
@@ -97,6 +99,8 @@ git commit -m "feat: track provisional and final meeting processing"
 
 ### Task 2: Transcribe uploaded chunks while a meeting is recording
 
+**Status: complete** (commit `07d4e66`)
+
 **Files:**
 - Create: `apps/server/src/provisional-transcription.ts`
 - Create: `apps/server/src/provisional-transcription.test.ts`
@@ -159,6 +163,8 @@ git commit -m "feat: transcribe meeting chunks while recording"
 
 ### Task 3: Publish provisional notes, then replace them with diarized results
 
+**Status: complete**
+
 **Files:**
 - Modify: `apps/server/src/reporting.ts`
 - Modify: `apps/server/src/reporting.test.ts`
@@ -217,6 +223,8 @@ git commit -m "feat: publish fast notes before speaker report"
 ```
 
 ### Task 4: Wait for final chunk upload before marking a meeting finished
+
+**Status: complete**
 
 **Files:**
 - Modify: `apps/extension/src/offscreen.ts`

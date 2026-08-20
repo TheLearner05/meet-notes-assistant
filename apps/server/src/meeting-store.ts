@@ -31,6 +31,7 @@ export type MeetingRecord = {
   provisionalError?: string;
   finalTranscript: TranscriptSegment[];
   finalReport?: MeetingReport;
+  finalError?: string;
   googleDocUrl?: string;
   error?: string;
 };

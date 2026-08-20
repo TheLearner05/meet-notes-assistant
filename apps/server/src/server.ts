@@ -4,7 +4,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 import OpenAI from 'openai';
 import { MeetingStore, type MeetingLanguage } from './meeting-store.js';
-import { processMeeting, reportAsMarkdown } from './reporting.js';
+import { processFinalDiarizedMeeting, processProvisionalMeeting, reportAsMarkdown } from './reporting.js';
 import { ProvisionalTranscriptionQueue } from './provisional-transcription.js';
 import { exportMeetingToGoogleDoc, googleAuthorizationUrl, saveGoogleCode } from './google-docs.js';
 
@@ -72,8 +72,8 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   const retryMatch = path.match(/^\/api\/meetings\/([a-z0-9-]+)\/retry$/i);
   if (request.method === 'POST' && retryMatch) {
     const existing = await requireMeeting(retryMatch[1]);
-    if (existing.status !== 'failed') throw new Error('Only failed meetings can be retried');
-    const meeting = await queueProcessing(existing.id);
+    if (existing.status !== 'failed' && !existing.finalError) throw new Error('Only failed processing can be retried');
+    const meeting = existing.finalError ? await queueFinalProcessing(existing.id) : await queueProcessing(existing.id);
     sendJson(response, 202, { id: meeting.id, status: 'processing' }); return;
   }
 
@@ -97,8 +97,14 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     const body = await readJson<{ labels?: Record<string, string> }>(request);
     const labels = body.labels ?? {};
     sendJson(response, 200, await store.update(speakerMatch[1], (meeting) => {
-      meeting.transcript = meeting.transcript.map((segment) => ({ ...segment, speakerLabel: labels[segment.speakerLabel]?.trim() || segment.speakerLabel }));
-      if (meeting.report) meeting.report.speakerStats = meeting.report.speakerStats.map((stat) => ({ ...stat, speakerLabel: labels[stat.speakerLabel]?.trim() || stat.speakerLabel }));
+      const relabel = (segments: typeof meeting.transcript) => segments.map((segment) => ({ ...segment, speakerLabel: labels[segment.speakerLabel]?.trim() || segment.speakerLabel }));
+      const relabelReport = (report: typeof meeting.report) => report && { ...report, speakerStats: report.speakerStats.map((stat) => ({ ...stat, speakerLabel: labels[stat.speakerLabel]?.trim() || stat.speakerLabel })) };
+      meeting.provisionalTranscript = relabel(meeting.provisionalTranscript);
+      meeting.finalTranscript = relabel(meeting.finalTranscript);
+      meeting.transcript = relabel(meeting.transcript);
+      meeting.provisionalReport = relabelReport(meeting.provisionalReport);
+      meeting.finalReport = relabelReport(meeting.finalReport);
+      meeting.report = relabelReport(meeting.report);
     })); return;
   }
 
@@ -112,8 +118,16 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
 
 async function requireMeeting(id: string) { const meeting = await store.get(id); if (!meeting) throw new Error('Meeting not found'); return meeting; }
 async function queueProcessing(id: string) {
-  const meeting = await store.update(id, (item) => { item.status = 'processing'; item.error = undefined; item.endedAt = new Date().toISOString(); });
-  void processMeeting(store, meeting.id, dataRoot).catch(async (error) => store.update(meeting.id, (item) => { item.status = 'failed'; item.error = error instanceof Error ? error.message : 'Processing failed'; }));
+  const meeting = await store.update(id, (item) => { item.status = 'processing'; item.processingStage = 'transcribing_fast'; item.error = undefined; item.endedAt ??= new Date().toISOString(); });
+  void (async () => {
+    await processProvisionalMeeting(store, meeting.id, (meetingId) => provisionalQueue.flush(meetingId));
+    if ((await store.get(meeting.id))?.provisionalReport) await processFinalDiarizedMeeting(store, meeting.id, dataRoot);
+  })();
+  return meeting;
+}
+async function queueFinalProcessing(id: string) {
+  const meeting = await store.update(id, (item) => { item.finalError = undefined; item.processingStage = 'diarizing'; item.error = undefined; });
+  void processFinalDiarizedMeeting(store, meeting.id, dataRoot);
   return meeting;
 }
 function setCors(response: ServerResponse) { response.setHeader('Access-Control-Allow-Origin', '*'); response.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS'); response.setHeader('Access-Control-Allow-Headers', 'Content-Type'); }
