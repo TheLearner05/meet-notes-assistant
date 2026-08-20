@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 export type MeetingLanguage = 'hi-en' | 'mr-en' | 'en' | 'auto';
 export type MeetingStatus = 'recording' | 'processing' | 'ready' | 'failed' | 'deleted';
+export type MeetingProcessingStage = 'recording' | 'transcribing_fast' | 'initial_ready' | 'diarizing' | 'final_ready' | 'failed';
 export type TranscriptSegment = { speakerLabel: string; startSeconds: number; endSeconds: number; text: string };
 export type MeetingReport = {
   summary: string;
@@ -18,12 +19,17 @@ export type MeetingRecord = {
   source: 'google-meet';
   language: MeetingLanguage;
   status: MeetingStatus;
+  processingStage: MeetingProcessingStage;
   createdAt: string;
   endedAt?: string;
   rawAudioDeleteAfter: string;
   audioChunks: string[];
   transcript: TranscriptSegment[];
   report?: MeetingReport;
+  provisionalTranscript: TranscriptSegment[];
+  provisionalReport?: MeetingReport;
+  finalTranscript: TranscriptSegment[];
+  finalReport?: MeetingReport;
   googleDocUrl?: string;
   error?: string;
 };
@@ -34,16 +40,20 @@ export function createMeetingRecord(language: MeetingLanguage, now = new Date())
     source: 'google-meet',
     language,
     status: 'recording',
+    processingStage: 'recording',
     createdAt: now.toISOString(),
     rawAudioDeleteAfter: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
     audioChunks: [],
     transcript: [],
+    provisionalTranscript: [],
+    finalTranscript: [],
   };
 }
 
 export class MeetingStore {
   private readonly databasePath: string;
   private readonly audioPath: string;
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly rootPath: string) {
     this.databasePath = join(rootPath, 'meetings.json');
@@ -56,11 +66,13 @@ export class MeetingStore {
   }
 
   async create(language: MeetingLanguage): Promise<MeetingRecord> {
-    const meetings = await this.load();
-    const meeting = createMeetingRecord(language);
-    meetings.unshift(meeting);
-    await this.save(meetings);
-    return meeting;
+    return this.mutate(async () => {
+      const meetings = await this.load();
+      const meeting = createMeetingRecord(language);
+      meetings.unshift(meeting);
+      await this.save(meetings);
+      return meeting;
+    });
   }
 
   async list(query = ''): Promise<MeetingRecord[]> {
@@ -73,12 +85,14 @@ export class MeetingStore {
   }
 
   async update(id: string, mutate: (meeting: MeetingRecord) => void): Promise<MeetingRecord> {
-    const meetings = await this.load();
-    const meeting = meetings.find((item) => item.id === id && item.status !== 'deleted');
-    if (!meeting) throw new Error('Meeting not found');
-    mutate(meeting);
-    await this.save(meetings);
-    return meeting;
+    return this.mutate(async () => {
+      const meetings = await this.load();
+      const meeting = meetings.find((item) => item.id === id && item.status !== 'deleted');
+      if (!meeting) throw new Error('Meeting not found');
+      mutate(meeting);
+      await this.save(meetings);
+      return meeting;
+    });
   }
 
   async saveChunk(id: string, sequence: string, audio: Buffer): Promise<void> {
@@ -105,6 +119,29 @@ export class MeetingStore {
     }
   }
 
-  private async load(): Promise<MeetingRecord[]> { return JSON.parse(await readFile(this.databasePath, 'utf8')) as MeetingRecord[]; }
+  private async mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.writeChain;
+    let release!: () => void;
+    this.writeChain = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try { return await operation(); } finally { release(); }
+  }
+
+  private async load(): Promise<MeetingRecord[]> {
+    const meetings = JSON.parse(await readFile(this.databasePath, 'utf8')) as MeetingRecord[];
+    return meetings.map((meeting) => this.hydrate(meeting));
+  }
+
+  private hydrate(meeting: MeetingRecord): MeetingRecord {
+    const processingStage = meeting.processingStage ?? (meeting.status === 'ready' ? 'final_ready' : meeting.status === 'failed' ? 'failed' : meeting.status === 'processing' ? 'diarizing' : 'recording');
+    return {
+      ...meeting,
+      processingStage,
+      provisionalTranscript: meeting.provisionalTranscript ?? [],
+      finalTranscript: meeting.finalTranscript ?? (processingStage === 'final_ready' ? meeting.transcript : []),
+      provisionalReport: meeting.provisionalReport,
+      finalReport: meeting.finalReport ?? (processingStage === 'final_ready' ? meeting.report : undefined),
+    };
+  }
   private async save(meetings: MeetingRecord[]): Promise<void> { await writeFile(this.databasePath, JSON.stringify(meetings, null, 2)); }
 }
