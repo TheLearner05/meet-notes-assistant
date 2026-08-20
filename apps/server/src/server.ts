@@ -1,14 +1,27 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createReadStream } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
+import OpenAI from 'openai';
 import { MeetingStore, type MeetingLanguage } from './meeting-store.js';
 import { processMeeting, reportAsMarkdown } from './reporting.js';
+import { ProvisionalTranscriptionQueue } from './provisional-transcription.js';
 import { exportMeetingToGoogleDoc, googleAuthorizationUrl, saveGoogleCode } from './google-docs.js';
 
 const port = Number(process.env.PORT ?? 8787);
 const dataRoot = resolve(process.env.DATA_DIRECTORY ?? join(process.cwd(), 'data'));
 const publicRoot = resolve(join(process.cwd(), 'public'));
 const store = new MeetingStore(dataRoot);
+const provisionalQueue = new ProvisionalTranscriptionQueue(store, async (audioPath, language) => {
+  if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not configured');
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const result = await openai.audio.transcriptions.create({
+    file: createReadStream(audioPath),
+    model: 'gpt-4o-transcribe',
+    ...(language === 'en' ? { language: 'en' } : {}),
+  } as never) as unknown as { text?: string };
+  return result.text ?? '';
+});
 await mkdir(dataRoot, { recursive: true });
 await store.init();
 await store.purgeExpiredAudio();
@@ -46,6 +59,7 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   const chunkMatch = path.match(/^\/api\/meetings\/([a-z0-9-]+)\/chunks\/(\d+)$/i);
   if (request.method === 'PUT' && chunkMatch) {
     await store.saveChunk(chunkMatch[1], chunkMatch[2], await readBody(request));
+    void provisionalQueue.enqueue(chunkMatch[1], Number(chunkMatch[2]), store.audioFile(`${chunkMatch[1]}-${chunkMatch[2]}.webm`), (await requireMeeting(chunkMatch[1])).language);
     sendJson(response, 200, { ok: true }); return;
   }
 
