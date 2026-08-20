@@ -6,3 +6,7 @@ export function isCapturableMeetTab(url: string | undefined): boolean {
 export function shouldStopRecordingForNavigation(recordingTabId: number | undefined, updatedTabId: number, url: string): boolean {
   return recordingTabId === updatedTabId && !isCapturableMeetTab(url);
 }
+
+export function shouldReleaseRecordingForNewStart(state: 'in-call' | 'lobby' | 'ended' | undefined): boolean {
+  return state !== 'in-call';
+}

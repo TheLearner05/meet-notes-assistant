@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isCapturableMeetTab, shouldStopRecordingForNavigation } from './tab-validation.js';
+import { isCapturableMeetTab, shouldReleaseRecordingForNewStart, shouldStopRecordingForNavigation } from './tab-validation.js';
 
 describe('isCapturableMeetTab', () => {
   it('allows an active Google Meet URL', () => {
@@ -20,5 +20,17 @@ describe('shouldStopRecordingForNavigation', () => {
 
   it('keeps recording when the same tab stays on Google Meet', () => {
     expect(shouldStopRecordingForNavigation(12, 12, 'https://meet.google.com/abc-defg-hij')).toBe(false);
+  });
+});
+
+describe('shouldReleaseRecordingForNewStart', () => {
+  it('releases a stale session when its tab is gone or no longer in a call', () => {
+    expect(shouldReleaseRecordingForNewStart(undefined)).toBe(true);
+    expect(shouldReleaseRecordingForNewStart('lobby')).toBe(true);
+    expect(shouldReleaseRecordingForNewStart('ended')).toBe(true);
+  });
+
+  it('keeps a genuinely live recording protected from a second start', () => {
+    expect(shouldReleaseRecordingForNewStart('in-call')).toBe(false);
   });
 });

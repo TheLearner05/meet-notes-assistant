@@ -16,7 +16,7 @@ function render(): void {
   if (prompt) return;
   prompt = document.createElement('div');
   prompt.id = 'meet-notes-assistant-prompt';
-  prompt.innerHTML = `<div style="font:14px system-ui,sans-serif;position:fixed;z-index:2147483647;right:20px;bottom:20px;width:280px;padding:16px;background:white;color:#172033;border-radius:12px;box-shadow:0 8px 28px #0004"><strong>Meeting detected</strong><p style="margin:8px 0">Confirm that everyone knows this meeting is being recorded, then click the <strong>Meet Notes Assistant</strong> icon in Chrome's toolbar to start.</p></div>`;
+  prompt.innerHTML = `<div role="status" style="font:13px system-ui,sans-serif;position:fixed;z-index:2147483647;right:16px;bottom:16px;width:220px;padding:10px 12px;background:#fff;color:#172033;border:1px solid #d9deea;border-radius:10px;box-shadow:0 5px 16px #0002"><strong style="display:block">Meeting ready</strong><span style="display:block;margin-top:3px;color:#5c6575">Click the extension icon to record.</span></div>`;
   document.documentElement.append(prompt);
 }
 
@@ -59,7 +59,8 @@ function showSavingBanner(): void {
   savingBannerTimer = window.setTimeout(() => { isSaving = false; banner.remove(); render(); }, SAVING_BANNER_MS);
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === 'GET_MEET_STATE') { sendResponse({ state: getMeetState(location.href, document) }); return; }
   if (message.type === 'RECORDING_STARTED') { isRecording = true; prompt?.remove(); prompt = undefined; showRecordingBanner(); render(); }
   if (message.type === 'RECORDING_STOPPED') { isRecording = false; showSavingBanner(); render(); }
 });
