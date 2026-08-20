@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MeetingStore } from './meeting-store.js';
 import { calculateSpeakerStats, parseMeetingReport, processFinalDiarizedMeeting, processProvisionalMeeting, reportAsMarkdown, transcriptDateTime } from './reporting.js';
 
@@ -75,6 +75,30 @@ describe('fast and final reports', () => {
     expect(reportAsMarkdown(saved!)).toContain('Initial notes — speaker attribution pending');
   });
 
+  it('rebuilds incomplete live fragments into complete initial notes after the meeting', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    await store.saveChunk(meeting.id, '1', Buffer.from('audio'));
+    await store.update(meeting.id, (item) => {
+      item.provisionalTranscript = [{ speakerLabel: 'Speaker pending', startSeconds: 0, endSeconds: 30, text: 'Only the first fragment' }];
+    });
+
+    const segment = vi.fn(async () => [
+      { audioPath: join(root, 'first.webm'), batchIndex: 0, startSeconds: 0 },
+      { audioPath: join(root, 'second.webm'), batchIndex: 1, startSeconds: 600 },
+    ]);
+    await processProvisionalMeeting(store, meeting.id, async () => undefined, async () => JSON.stringify({ summary: 'Complete notes', decisions: [], actionItems: [], openQuestions: [] }), {
+      dataRoot: root,
+      transcribe: async (audioPath) => audioPath.endsWith('first.webm') ? 'First complete section' : 'Second complete section',
+      segmentAudio: segment,
+    });
+
+    const saved = await store.get(meeting.id);
+    expect(segment).toHaveBeenCalledOnce();
+    expect(saved?.provisionalTranscript.map((item) => item.text)).toEqual(['First complete section', 'Second complete section']);
+    expect(saved?.provisionalTranscript.map((item) => item.startSeconds)).toEqual([0, 600]);
+  });
+
   it('keeps initial notes available if the later speaker report fails', async () => {
     const { store, root, meeting } = await createTestMeeting();
     await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
@@ -89,12 +113,39 @@ describe('fast and final reports', () => {
     await processFinalDiarizedMeeting(store, meeting.id, root, {
       diarize: async () => { throw new Error('Diarization temporarily unavailable'); },
       summarize: async () => '{}',
-    });
+    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }]);
 
     const saved = await store.get(meeting.id);
     expect(saved?.status).toBe('ready');
     expect(saved?.processingStage).toBe('initial_ready');
     expect(saved?.report?.summary).toBe('Initial notes');
     expect(saved?.finalError).toBe('Diarization temporarily unavailable');
+  });
+
+  it('splits long recordings into diarization-safe sections with correct transcript offsets', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    for (let sequence = 0; sequence < 36; sequence += 1) await store.saveChunk(meeting.id, String(sequence), Buffer.from(`audio-${sequence}`));
+    const audioPaths: string[] = [];
+    const segment = vi.fn(async () => [
+      { audioPath: join(root, 'first.webm'), batchIndex: 0, startSeconds: 0 },
+      { audioPath: join(root, 'second.webm'), batchIndex: 1, startSeconds: 1050 },
+    ]);
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async (audioPath) => {
+        audioPaths.push(audioPath);
+        return { segments: [{ speaker: 'A', start: 0, end: 10, text: 'Discussion' }] };
+      },
+      summarize: async () => JSON.stringify({ summary: 'Done', decisions: [], actionItems: [], openQuestions: [] }),
+    }, segment);
+
+    const saved = await store.get(meeting.id);
+    expect(segment).toHaveBeenCalledOnce();
+    expect(audioPaths).toHaveLength(2);
+    expect(saved?.processingStage).toBe('final_ready');
+    expect(saved?.finalTranscript).toMatchObject([
+      { speakerLabel: 'Speaker A', startSeconds: 0 },
+      { speakerLabel: 'Speaker 2-A', startSeconds: 1050 },
+    ]);
   });
 });

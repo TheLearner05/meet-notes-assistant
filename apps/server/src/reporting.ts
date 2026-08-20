@@ -1,5 +1,6 @@
 import { createReadStream } from 'node:fs';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import OpenAI from 'openai';
 import type { MeetingLanguage, MeetingRecord, MeetingReport, MeetingStore, TranscriptSegment } from './meeting-store.js';
@@ -7,7 +8,11 @@ import type { MeetingLanguage, MeetingRecord, MeetingReport, MeetingStore, Trans
 export type MeetingAi = {
   diarize: (audioPath: string, language: MeetingLanguage) => Promise<{ text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }>;
   summarize: (transcriptText: string) => Promise<string | null | undefined>;
+  transcribe?: (audioPath: string, language: MeetingLanguage) => Promise<string>;
 };
+export type DiarizationAudioSegment = { audioPath: string; batchIndex: number; startSeconds: number };
+export type DiarizationSegmenter = (sourceAudioPath: string, audioDirectory: string, meetingId: string) => Promise<DiarizationAudioSegment[]>;
+export type ProvisionalProcessingOptions = { dataRoot?: string; transcribe?: (audioPath: string, language: MeetingLanguage) => Promise<string>; segmentAudio?: DiarizationSegmenter };
 
 export function calculateSpeakerStats(segments: TranscriptSegment[]): { speakerLabel: string; talkSeconds: number }[] {
   const totals = new Map<string, number>();
@@ -50,30 +55,46 @@ export function reportAsMarkdown(meeting: MeetingRecord): string {
   return `# Meeting report\n\n${isInitial ? '## Initial notes — speaker attribution pending\n\n' : ''}## Summary\n${report.summary}\n\n## Decisions\n${report.decisions.map((item) => `- ${item}`).join('\n') || '- None stated'}\n\n## Action items\n${actions}\n\n## Open questions\n${report.openQuestions.map((item) => `- ${item}`).join('\n') || '- None stated'}\n\n## Speaker report\n${report.speakerStats.map((item) => `- ${item.speakerLabel}: ${Math.round(item.talkSeconds)} seconds`).join('\n')}\n\n## Transcript\n${formattedTranscript}`;
 }
 
-export async function processProvisionalMeeting(store: MeetingStore, meetingId: string, flushChunks: (meetingId: string) => Promise<void>, summarize?: (transcriptText: string) => Promise<string | null | undefined>): Promise<void> {
+export async function processProvisionalMeeting(store: MeetingStore, meetingId: string, flushChunks: (meetingId: string) => Promise<void>, summarize?: (transcriptText: string) => Promise<string | null | undefined>, options: ProvisionalProcessingOptions = {}): Promise<void> {
   try {
     await store.update(meetingId, (item) => { item.status = 'processing'; item.processingStage = 'transcribing_fast'; item.error = undefined; item.provisionalError = undefined; });
     await flushChunks(meetingId);
     const meeting = await requireMeeting(store, meetingId);
-    if (!meeting.provisionalTranscript.length) throw new Error('The recording did not contain transcribable speech.');
-    const report = parseMeetingReport(await (summarize ?? createOpenAiMeetingAi().summarize)(transcriptAsText(meeting.provisionalTranscript)), meeting.provisionalTranscript);
-    await store.update(meetingId, (item) => { item.provisionalReport = report; item.report = report; item.transcript = item.provisionalTranscript; item.status = 'ready'; item.processingStage = 'initial_ready'; item.error = undefined; });
+    let transcript = meeting.provisionalTranscript;
+    if (options.dataRoot && transcript.length < meeting.audioChunks.length) {
+      transcript = await rebuildProvisionalTranscript(store, meeting, options.dataRoot, options.transcribe ?? createOpenAiMeetingAi().transcribe!, options.segmentAudio ?? segmentFastTranscriptionAudio);
+      await store.update(meetingId, (item) => { item.provisionalTranscript = transcript; });
+    }
+    if (!transcript.length) throw new Error('The recording did not contain transcribable speech.');
+    const report = parseMeetingReport(await (summarize ?? createOpenAiMeetingAi().summarize)(transcriptAsText(transcript)), transcript);
+    await store.update(meetingId, (item) => { item.provisionalReport = report; item.report = report; item.transcript = transcript; item.status = 'ready'; item.processingStage = 'initial_ready'; item.error = undefined; });
   } catch (error) {
     await store.update(meetingId, (item) => { item.status = 'failed'; item.processingStage = 'failed'; item.error = errorMessage(error); item.provisionalError = item.error; });
   }
 }
 
-export async function processFinalDiarizedMeeting(store: MeetingStore, meetingId: string, dataRoot: string, ai?: MeetingAi): Promise<void> {
+export async function processFinalDiarizedMeeting(store: MeetingStore, meetingId: string, dataRoot: string, ai?: MeetingAi, segmentAudio: DiarizationSegmenter = segmentDiarizationAudio): Promise<void> {
   try {
     const before = await requireMeeting(store, meetingId);
     if (!before.audioChunks.length) throw new Error('No audio was captured');
     await store.update(meetingId, (item) => { item.processingStage = 'diarizing'; item.status = item.provisionalReport ? 'ready' : 'processing'; item.error = undefined; item.finalError = undefined; });
     const meeting = await requireMeeting(store, meetingId);
-    const audioPath = join(dataRoot, 'audio', `${meetingId}.webm`);
-    const chunks = await Promise.all(meeting.audioChunks.map((file) => readFile(store.audioFile(file))));
-    await writeFile(audioPath, Buffer.concat(chunks));
+    const audioDirectory = join(dataRoot, 'audio');
+    const sourceAudioPath = join(audioDirectory, `${meetingId}-source.webm`);
+    const chunks = await Promise.all([...meeting.audioChunks].sort((left, right) => chunkSequence(left) - chunkSequence(right)).map((file) => readFile(store.audioFile(file))));
+    await writeFile(sourceAudioPath, Buffer.concat(chunks));
     const worker = ai ?? createOpenAiMeetingAi();
-    const transcript = transcriptFromDiarizedResponse(await worker.diarize(audioPath, meeting.language));
+    const transcript: TranscriptSegment[] = [];
+    let segments: DiarizationAudioSegment[] = [];
+    try {
+      segments = await segmentAudio(sourceAudioPath, audioDirectory, meetingId);
+      for (const segment of segments) {
+        const result = await worker.diarize(segment.audioPath, meeting.language);
+        transcript.push(...transcriptFromDiarizedResponse(result, segment.startSeconds, segment.batchIndex));
+      }
+    } finally {
+      await Promise.all([rm(sourceAudioPath, { force: true }), ...segments.map((segment) => rm(segment.audioPath, { force: true }))]);
+    }
     if (!transcript.length) throw new Error('The recording did not contain transcribable speech.');
     const report = parseMeetingReport(await worker.summarize(transcriptAsText(transcript)), transcript);
     await store.update(meetingId, (item) => { item.finalTranscript = transcript; item.finalReport = report; item.transcript = transcript; item.report = report; item.status = 'ready'; item.processingStage = 'final_ready'; item.error = undefined; item.finalError = undefined; });
@@ -97,13 +118,64 @@ function createOpenAiMeetingAi(): MeetingAi {
       const completion = await openai.chat.completions.create({ model: process.env.OPENAI_SUMMARY_MODEL ?? 'gpt-4.1-mini', response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'Create an accurate English meeting report from the transcript. Return JSON with summary (string), decisions (string[]), actionItems ({text, ownerSpeakerLabel?, dueDate?}[]), and openQuestions (string[]). Do not invent decisions, owners, or due dates; use null for unknown due dates.' }, { role: 'user', content: transcriptText }] });
       return completion.choices[0]?.message.content;
     },
+    transcribe: async (audioPath, language) => {
+      const result = await openai.audio.transcriptions.create({ file: createReadStream(audioPath), model: 'gpt-4o-transcribe', ...(language === 'en' ? { language: 'en' } : {}) } as never) as unknown as { text?: string };
+      return result.text ?? '';
+    },
   };
 }
 
-function transcriptFromDiarizedResponse(transcription: { text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }): TranscriptSegment[] {
-  const transcript = (transcription.segments ?? []).map((segment, index) => ({ speakerLabel: `Speaker ${segment.speaker ?? String.fromCharCode(65 + index % 26)}`, startSeconds: segment.start ?? 0, endSeconds: segment.end ?? 0, text: segment.text ?? '' }));
-  if (!transcript.length && transcription.text?.trim()) transcript.push({ speakerLabel: 'Speaker A', startSeconds: 0, endSeconds: 0, text: transcription.text.trim() });
+async function rebuildProvisionalTranscript(store: MeetingStore, meeting: MeetingRecord, dataRoot: string, transcribe: (audioPath: string, language: MeetingLanguage) => Promise<string>, segmentAudio: DiarizationSegmenter): Promise<TranscriptSegment[]> {
+  const audioDirectory = join(dataRoot, 'audio');
+  const sourceAudioPath = join(audioDirectory, `${meeting.id}-initial-source.webm`);
+  const chunks = await Promise.all([...meeting.audioChunks].sort((left, right) => chunkSequence(left) - chunkSequence(right)).map((file) => readFile(store.audioFile(file))));
+  await writeFile(sourceAudioPath, Buffer.concat(chunks));
+  let segments: DiarizationAudioSegment[] = [];
+  try {
+    segments = await segmentAudio(sourceAudioPath, audioDirectory, meeting.id);
+    const text = await mapWithConcurrency(segments, 2, async (segment) => (await transcribe(segment.audioPath, meeting.language)).trim());
+    return segments.flatMap((segment, index) => text[index] ? [{ speakerLabel: 'Speaker pending', startSeconds: segment.startSeconds, endSeconds: segment.startSeconds + 600, text: text[index] }] : []);
+  } finally {
+    await Promise.all([rm(sourceAudioPath, { force: true }), ...segments.map((segment) => rm(segment.audioPath, { force: true }))]);
+  }
+}
+
+function transcriptFromDiarizedResponse(transcription: { text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }, offsetSeconds: number, batchIndex: number): TranscriptSegment[] {
+  const speakerPrefix = batchIndex ? `${batchIndex + 1}-` : '';
+  const transcript = (transcription.segments ?? []).map((segment, index) => ({ speakerLabel: `Speaker ${speakerPrefix}${segment.speaker ?? String.fromCharCode(65 + index % 26)}`, startSeconds: offsetSeconds + (segment.start ?? 0), endSeconds: offsetSeconds + (segment.end ?? 0), text: segment.text ?? '' }));
+  if (!transcript.length && transcription.text?.trim()) transcript.push({ speakerLabel: `Speaker ${speakerPrefix}A`, startSeconds: offsetSeconds, endSeconds: offsetSeconds, text: transcription.text.trim() });
   return transcript;
+}
+async function segmentDiarizationAudio(sourceAudioPath: string, audioDirectory: string, meetingId: string): Promise<DiarizationAudioSegment[]> {
+  return segmentAudioFile(sourceAudioPath, audioDirectory, meetingId, 'diarization', 1050);
+}
+async function segmentFastTranscriptionAudio(sourceAudioPath: string, audioDirectory: string, meetingId: string): Promise<DiarizationAudioSegment[]> {
+  return segmentAudioFile(sourceAudioPath, audioDirectory, meetingId, 'initial', 600);
+}
+async function segmentAudioFile(sourceAudioPath: string, audioDirectory: string, meetingId: string, purpose: string, seconds: number): Promise<DiarizationAudioSegment[]> {
+  const outputPattern = join(audioDirectory, `${meetingId}-${purpose}-%03d.webm`);
+  await runFfmpeg(['-y', '-hide_banner', '-loglevel', 'error', '-i', sourceAudioPath, '-map', '0:a', '-c:a', 'copy', '-f', 'segment', '-segment_time', String(seconds), '-reset_timestamps', '1', outputPattern]);
+  const files = (await readdir(audioDirectory)).filter((file) => new RegExp(`^${meetingId}-${purpose}-\\d{3}\\.webm$`).test(file)).sort();
+  if (!files.length) throw new Error('Could not prepare the recording for speaker analysis.');
+  return files.map((file, batchIndex) => ({ audioPath: join(audioDirectory, file), batchIndex, startSeconds: batchIndex * seconds }));
+}
+async function runFfmpeg(args: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const process = spawn('ffmpeg', args, { windowsHide: true });
+    let errorOutput = '';
+    process.stderr.on('data', (chunk: Buffer) => { errorOutput += chunk.toString(); });
+    process.once('error', () => reject(new Error('FFmpeg is required to prepare longer recordings. Install FFmpeg, then retry this meeting.')));
+    process.once('close', (code) => code === 0 ? resolve() : reject(new Error(errorOutput.trim() || 'Could not prepare the recording for speaker analysis.')));
+  });
+}
+function chunkSequence(file: string): number { return Number(file.match(/-(\d+)\.webm$/i)?.[1] ?? 0); }
+async function mapWithConcurrency<T, R>(values: T[], concurrency: number, transform: (value: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(values.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (next < values.length) { const index = next++; results[index] = await transform(values[index]); }
+  }));
+  return results;
 }
 function transcriptAsText(transcript: TranscriptSegment[]): string { return transcript.map((segment) => `${segment.speakerLabel} [${formatTime(segment.startSeconds)}]: ${segment.text}`).join('\n'); }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : 'Processing failed'; }

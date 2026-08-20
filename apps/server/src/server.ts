@@ -120,7 +120,7 @@ async function requireMeeting(id: string) { const meeting = await store.get(id);
 async function queueProcessing(id: string) {
   const meeting = await store.update(id, (item) => { item.status = 'processing'; item.processingStage = 'transcribing_fast'; item.error = undefined; item.endedAt ??= new Date().toISOString(); });
   void (async () => {
-    await processProvisionalMeeting(store, meeting.id, (meetingId) => provisionalQueue.flush(meetingId));
+    await processProvisionalMeeting(store, meeting.id, (meetingId) => provisionalQueue.flush(meetingId), undefined, { dataRoot });
     if ((await store.get(meeting.id))?.provisionalReport) await processFinalDiarizedMeeting(store, meeting.id, dataRoot);
   })();
   return meeting;
