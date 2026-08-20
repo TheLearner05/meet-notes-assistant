@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { shouldAutoStopRecording, shouldShowRecordingPrompt } from './recording-prompt.js';
+import { recordingStatusMessage, shouldAutoStopRecording, shouldShowRecordingPrompt } from './recording-prompt.js';
 
 describe('shouldShowRecordingPrompt', () => {
   it('shows one prompt for an active call that is not already recording', () => {
@@ -21,5 +21,12 @@ describe('shouldAutoStopRecording', () => {
   it('does not stop a live call or an inactive recorder', () => {
     expect(shouldAutoStopRecording('in-call', true)).toBe(false);
     expect(shouldAutoStopRecording('lobby', false)).toBe(false);
+  });
+});
+
+describe('recordingStatusMessage', () => {
+  it('uses unmistakable messages for recording on and recording off', () => {
+    expect(recordingStatusMessage('on')).toBe('● RECORDING ON');
+    expect(recordingStatusMessage('off')).toBe('✓ RECORDING OFF — Saving meeting');
   });
 });
