@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 export type MeetingLanguage = 'hi-en' | 'mr-en' | 'en' | 'auto';
 export type MeetingStatus = 'recording' | 'processing' | 'ready' | 'failed' | 'deleted';
 export type MeetingProcessingStage = 'recording' | 'transcribing_fast' | 'initial_ready' | 'diarizing' | 'final_ready' | 'failed';
+export type MeetingProcessingProgress = { completed: number; total: number; retrying?: number };
 export type TranscriptSegment = { speakerLabel: string; startSeconds: number; endSeconds: number; text: string };
 export type MeetingReport = {
   summary: string;
@@ -20,6 +21,7 @@ export type MeetingRecord = {
   language: MeetingLanguage;
   status: MeetingStatus;
   processingStage: MeetingProcessingStage;
+  processingProgress?: MeetingProcessingProgress;
   createdAt: string;
   endedAt?: string;
   rawAudioDeleteAfter: string;
@@ -43,6 +45,7 @@ export function createMeetingRecord(language: MeetingLanguage, now = new Date())
     language,
     status: 'recording',
     processingStage: 'recording',
+    processingProgress: { completed: 0, total: 0 },
     createdAt: now.toISOString(),
     rawAudioDeleteAfter: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
     audioChunks: [],
@@ -139,6 +142,7 @@ export class MeetingStore {
     return {
       ...meeting,
       processingStage,
+      processingProgress: meeting.processingProgress ?? { completed: 0, total: 0 },
       provisionalTranscript: meeting.provisionalTranscript ?? [],
       finalTranscript: meeting.finalTranscript ?? (processingStage === 'final_ready' ? meeting.transcript : []),
       provisionalReport: meeting.provisionalReport,

@@ -22,6 +22,7 @@ describe('fast processing state', () => {
   it('creates separate provisional and final state for a new meeting', () => {
     expect(createMeetingRecord('auto')).toMatchObject({
       processingStage: 'recording',
+      processingProgress: { completed: 0, total: 0 },
       provisionalTranscript: [],
       finalTranscript: [],
     });
