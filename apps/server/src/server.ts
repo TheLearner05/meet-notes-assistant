@@ -7,6 +7,7 @@ import { MeetingStore, type MeetingLanguage } from './meeting-store.js';
 import { processFinalDiarizedMeeting, processProvisionalMeeting, reportAsMarkdown } from './reporting.js';
 import { ProvisionalTranscriptionQueue } from './provisional-transcription.js';
 import { exportMeetingToGoogleDoc, googleAuthorizationUrl, saveGoogleCode } from './google-docs.js';
+import { openAiLanguageHints, openAiVocabulary } from './transcription-config.js';
 
 const port = Number(process.env.PORT ?? 8787);
 const dataRoot = resolve(process.env.DATA_DIRECTORY ?? join(process.cwd(), 'data'));
@@ -17,8 +18,9 @@ const provisionalQueue = new ProvisionalTranscriptionQueue(store, async (audioPa
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   const result = await openai.audio.transcriptions.create({
     file: createReadStream(audioPath),
-    model: 'gpt-4o-transcribe',
-    ...(language === 'en' ? { language: 'en' } : {}),
+    model: 'gpt-transcribe',
+    languages: openAiLanguageHints(language),
+    keywords: openAiVocabulary(),
   } as never) as unknown as { text?: string };
   return result.text ?? '';
 });

@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import OpenAI from 'openai';
 import type { MeetingLanguage, MeetingRecord, MeetingReport, MeetingStore, TranscriptSegment } from './meeting-store.js';
+import { openAiLanguageHints, openAiVocabulary } from './transcription-config.js';
 
 export type MeetingAi = {
   diarize: (audioPath: string, language: MeetingLanguage) => Promise<{ text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }>;
@@ -119,7 +120,7 @@ function createOpenAiMeetingAi(): MeetingAi {
       return completion.choices[0]?.message.content;
     },
     transcribe: async (audioPath, language) => {
-      const result = await openai.audio.transcriptions.create({ file: createReadStream(audioPath), model: 'gpt-4o-transcribe', ...(language === 'en' ? { language: 'en' } : {}) } as never) as unknown as { text?: string };
+      const result = await openai.audio.transcriptions.create({ file: createReadStream(audioPath), model: 'gpt-transcribe', languages: openAiLanguageHints(language), keywords: openAiVocabulary() } as never) as unknown as { text?: string };
       return result.text ?? '';
     },
   };
