@@ -148,4 +148,43 @@ describe('fast and final reports', () => {
       { speakerLabel: 'Speaker 2-A', startSeconds: 1050 },
     ]);
   });
+
+  it('keeps final sections in time order and records completed speaker work', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    const segment = async () => [
+      { audioPath: join(root, 'first.webm'), batchIndex: 0, startSeconds: 0 },
+      { audioPath: join(root, 'second.webm'), batchIndex: 1, startSeconds: 600 },
+    ];
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async (audioPath) => {
+        if (audioPath.endsWith('first.webm')) await new Promise((done) => setTimeout(done, 20));
+        return { segments: [{ speaker: 'A', start: 0, end: 3, text: audioPath.endsWith('first.webm') ? 'first' : 'second' }] };
+      },
+      summarize: async () => '{}',
+    }, segment);
+
+    const saved = await store.get(meeting.id);
+    expect(saved?.finalTranscript.map((item) => item.text)).toEqual(['first', 'second']);
+    expect(saved?.processingProgress).toEqual({ completed: 2, total: 2 });
+  });
+
+  it('retries a timed-out speaker section', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    let calls = 0;
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error('Request timed out.');
+        return { segments: [{ speaker: 'A', start: 0, end: 1, text: 'recovered' }] };
+      },
+      summarize: async () => '{}',
+    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }]);
+
+    expect(calls).toBe(2);
+    expect((await store.get(meeting.id))?.finalTranscript[0]?.text).toBe('recovered');
+  });
 });

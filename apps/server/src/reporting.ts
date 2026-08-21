@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import OpenAI from 'openai';
 import type { MeetingLanguage, MeetingRecord, MeetingReport, MeetingStore, TranscriptSegment } from './meeting-store.js';
+import { retryTransient } from './processing-retry.js';
 import { openAiLanguageHints, openAiVocabulary } from './transcription-config.js';
 
 export type MeetingAi = {
@@ -89,10 +90,16 @@ export async function processFinalDiarizedMeeting(store: MeetingStore, meetingId
     let segments: DiarizationAudioSegment[] = [];
     try {
       segments = await segmentAudio(sourceAudioPath, audioDirectory, meetingId);
-      for (const segment of segments) {
-        const result = await worker.diarize(segment.audioPath, meeting.language);
-        transcript.push(...transcriptFromDiarizedResponse(result, segment.startSeconds, segment.batchIndex));
-      }
+      await store.update(meetingId, (item) => { item.processingProgress = { completed: 0, total: segments.length }; });
+      const diarizedSections = await mapWithConcurrency(segments, 2, async (segment) => {
+        const result = await retryTransient(() => worker.diarize(segment.audioPath, meeting.language));
+        await store.update(meetingId, (item) => {
+          const progress = item.processingProgress ?? { completed: 0, total: segments.length };
+          item.processingProgress = { ...progress, completed: Math.min(progress.total, progress.completed + 1) };
+        });
+        return transcriptFromDiarizedResponse(result, segment.startSeconds, segment.batchIndex);
+      });
+      transcript.push(...diarizedSections.flat());
     } finally {
       await Promise.all([rm(sourceAudioPath, { force: true }), ...segments.map((segment) => rm(segment.audioPath, { force: true }))]);
     }
@@ -148,7 +155,7 @@ function transcriptFromDiarizedResponse(transcription: { text?: string; segments
   return transcript;
 }
 async function segmentDiarizationAudio(sourceAudioPath: string, audioDirectory: string, meetingId: string): Promise<DiarizationAudioSegment[]> {
-  return segmentAudioFile(sourceAudioPath, audioDirectory, meetingId, 'diarization', 1050);
+  return segmentAudioFile(sourceAudioPath, audioDirectory, meetingId, 'diarization', 600);
 }
 async function segmentFastTranscriptionAudio(sourceAudioPath: string, audioDirectory: string, meetingId: string): Promise<DiarizationAudioSegment[]> {
   return segmentAudioFile(sourceAudioPath, audioDirectory, meetingId, 'initial', 600);
