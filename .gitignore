@@ -6,3 +6,5 @@ coverage/
 *.tsbuildinfo
 apps/server/data/
 apps/extension/dist/
+logs/
+.playwright-mcp/

@@ -1,4 +1,5 @@
 import type { MeetingLanguage, MeetingStore } from './meeting-store.js';
+import { collapseHallucinatedRepetition } from './transcription-quality.js';
 
 export type ChunkTranscriber = (audioPath: string, language: MeetingLanguage) => Promise<string>;
 
@@ -49,7 +50,7 @@ export class ProvisionalTranscriptionQueue {
   private async execute(job: Job): Promise<void> {
     try {
       await this.store.update(job.meetingId, (meeting) => { if (meeting.processingStage === 'recording') meeting.processingStage = 'transcribing_fast'; });
-      const text = (await this.transcribe(job.audioPath, job.language)).trim();
+      const text = collapseHallucinatedRepetition((await this.transcribe(job.audioPath, job.language)).trim());
       if (text) {
         await this.store.update(job.meetingId, (meeting) => {
           meeting.provisionalTranscript = [

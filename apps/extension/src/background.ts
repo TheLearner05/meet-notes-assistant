@@ -47,7 +47,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await recordingSession.start(tabId);
         chrome.runtime.sendMessage({ type: 'OFFSCREEN_START', meetingId: meeting.id, streamId: streamIds.get(tabId) });
         await chrome.action.setBadgeText({ tabId, text: 'REC' });
-        await chrome.tabs.sendMessage(tabId, { type: 'RECORDING_STARTED' });
+        try { await chrome.tabs.sendMessage(tabId, { type: 'RECORDING_STARTED' }); } catch { /* The content script will pick up state via GET_RECORDING_STATE once it's ready. */ }
         sendResponse({ ok: true });
       } catch (error) { sendResponse({ ok: false, error: error instanceof Error ? error.message : 'Unable to start recording' }); }
     })();
@@ -57,7 +57,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void (async () => { await stopRecording(message.tabId as number | undefined ?? sender.tab?.id); sendResponse({ ok: true }); })();
     return true;
   }
+  if (message.type === 'PAUSE_RECORDING') {
+    void (async () => {
+      const tabId = message.tabId as number | undefined ?? sender.tab?.id;
+      if (tabId === undefined || await recordingSession.activeTabId() !== tabId) { sendResponse({ ok: false, error: 'This tab is not currently recording.' }); return; }
+      const ack = await sendToOffscreen({ type: 'OFFSCREEN_PAUSE' });
+      if (!ack?.paused) { sendResponse({ ok: false, error: 'Could not pause the recorder.' }); return; }
+      await recordingSession.pause(tabId);
+      await chrome.action.setBadgeText({ tabId, text: 'PAUSE' });
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+  if (message.type === 'RESUME_RECORDING') {
+    void (async () => {
+      const tabId = message.tabId as number | undefined ?? sender.tab?.id;
+      if (tabId === undefined || await recordingSession.activeTabId() !== tabId) { sendResponse({ ok: false, error: 'This tab is not currently recording.' }); return; }
+      const ack = await sendToOffscreen({ type: 'OFFSCREEN_RESUME' });
+      if (ack?.paused !== false) { sendResponse({ ok: false, error: 'Could not resume the recorder.' }); return; }
+      await recordingSession.resume(tabId);
+      await chrome.action.setBadgeText({ tabId, text: 'REC' });
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
   if (message.type === 'MEETING_ENDED') { void stopRecording(sender.tab?.id); }
+  if (message.type === 'GET_RECORDING_STATE') {
+    void (async () => {
+      const tabId = sender.tab?.id;
+      const recording = tabId !== undefined && await recordingSession.activeTabId() === tabId;
+      if (!recording) { sendResponse({ recording: false }); return; }
+      const paused = await recordingSession.isPaused();
+      await chrome.action.setBadgeText({ tabId, text: paused ? 'PAUSE' : 'REC' });
+      sendResponse({ recording: true, paused });
+    })();
+    return true;
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => { void stopRecording(tabId); });
@@ -76,6 +111,11 @@ async function stopRecording(tabId: number | undefined): Promise<boolean> {
   await chrome.action.setBadgeText({ tabId: activeTabId, text: '' });
   try { await chrome.tabs.sendMessage(activeTabId, { type: 'RECORDING_STOPPED' }); } catch { /* The tab may already be closed. */ }
   return true;
+}
+
+async function sendToOffscreen(message: { type: string }): Promise<{ paused?: boolean } | undefined> {
+  try { return await chrome.runtime.sendMessage(message) as { paused?: boolean } | undefined; }
+  catch { return undefined; }
 }
 
 async function getMeetState(tabId: number): Promise<'in-call' | 'lobby' | 'ended' | undefined> {

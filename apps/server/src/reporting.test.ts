@@ -3,10 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MeetingStore } from './meeting-store.js';
-import { calculateSpeakerStats, parseMeetingReport, processFinalDiarizedMeeting, processProvisionalMeeting, reportAsMarkdown, transcriptDateTime } from './reporting.js';
+import { calculateSpeakerStats, mappingsToRecord, parseMeetingReport, processFinalDiarizedMeeting, processProvisionalMeeting, reportAsMarkdown, transcriptDateTime } from './reporting.js';
 
 const temporaryFolders: string[] = [];
 afterEach(async () => { await Promise.all(temporaryFolders.splice(0).map((folder) => rm(folder, { recursive: true, force: true }))); });
+
+const notSilent = async () => -20;
 
 async function createTestMeeting() {
   const root = await mkdtemp(join(tmpdir(), 'meet-notes-reporting-'));
@@ -48,6 +50,47 @@ describe('parseMeetingReport', () => {
     const report = parseMeetingReport('{"summary":"Partially', []);
 
     expect(report.summary).toBe('The transcript was saved, but an AI summary was unavailable.');
+  });
+
+  it('keeps the meeting usable when the AI response is valid JSON but not an object', () => {
+    const report = parseMeetingReport('"just a string"', []);
+
+    expect(report.summary).toBe('The transcript was saved, but an AI summary was unavailable.');
+  });
+
+  it('trusts a schema-conformant report object without re-validating every field', () => {
+    const report = parseMeetingReport(JSON.stringify({
+      summary: 'Launch review',
+      decisions: ['Ship Friday'],
+      actionItems: [{ text: 'File the ticket', ownerSpeakerLabel: 'Speaker A', dueDate: null }],
+      openQuestions: ['Who owns rollback?'],
+    }), []);
+
+    expect(report.summary).toBe('Launch review');
+    expect(report.decisions).toEqual(['Ship Friday']);
+    expect(report.actionItems).toEqual([{ text: 'File the ticket', ownerSpeakerLabel: 'Speaker A', dueDate: null }]);
+    expect(report.openQuestions).toEqual(['Who owns rollback?']);
+  });
+});
+
+describe('mappingsToRecord', () => {
+  it('converts a from/to mapping array into a lookup record', () => {
+    expect(mappingsToRecord([
+      { from: 'Speaker A', to: 'Speaker A' },
+      { from: 'Speaker 2-A', to: 'Speaker A' },
+    ])).toEqual({ 'Speaker A': 'Speaker A', 'Speaker 2-A': 'Speaker A' });
+  });
+
+  it('returns undefined for a missing or non-array mappings field', () => {
+    expect(mappingsToRecord(undefined)).toBeUndefined();
+    expect(mappingsToRecord(null)).toBeUndefined();
+  });
+
+  it('drops entries with a non-string from or to', () => {
+    expect(mappingsToRecord([
+      { from: 'Speaker A', to: 'Speaker A' },
+      { from: 42, to: 'Speaker A' },
+    ] as never)).toEqual({ 'Speaker A': 'Speaker A' });
   });
 });
 
@@ -91,6 +134,7 @@ describe('fast and final reports', () => {
       dataRoot: root,
       transcribe: async (audioPath) => audioPath.endsWith('first.webm') ? 'First complete section' : 'Second complete section',
       segmentAudio: segment,
+      measureVolume: notSilent,
     });
 
     const saved = await store.get(meeting.id);
@@ -113,7 +157,7 @@ describe('fast and final reports', () => {
     await processFinalDiarizedMeeting(store, meeting.id, root, {
       diarize: async () => { throw new Error('Diarization temporarily unavailable'); },
       summarize: async () => '{}',
-    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }]);
+    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }], notSilent);
 
     const saved = await store.get(meeting.id);
     expect(saved?.status).toBe('ready');
@@ -137,7 +181,7 @@ describe('fast and final reports', () => {
         return { segments: [{ speaker: 'A', start: 0, end: 10, text: 'Discussion' }] };
       },
       summarize: async () => JSON.stringify({ summary: 'Done', decisions: [], actionItems: [], openQuestions: [] }),
-    }, segment);
+    }, segment, notSilent);
 
     const saved = await store.get(meeting.id);
     expect(segment).toHaveBeenCalledOnce();
@@ -163,7 +207,7 @@ describe('fast and final reports', () => {
         return { segments: [{ speaker: 'A', start: 0, end: 3, text: audioPath.endsWith('first.webm') ? 'first' : 'second' }] };
       },
       summarize: async () => '{}',
-    }, segment);
+    }, segment, notSilent);
 
     const saved = await store.get(meeting.id);
     expect(saved?.finalTranscript.map((item) => item.text)).toEqual(['first', 'second']);
@@ -182,9 +226,161 @@ describe('fast and final reports', () => {
         return { segments: [{ speaker: 'A', start: 0, end: 1, text: 'recovered' }] };
       },
       summarize: async () => '{}',
-    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }]);
+    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }], notSilent);
 
     expect(calls).toBe(2);
     expect((await store.get(meeting.id))?.finalTranscript[0]?.text).toBe('recovered');
+  });
+
+  it('never sends a near-silent section to the speaker-analysis model, to avoid hallucinated transcripts', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    let diarizeCalls = 0;
+    const segment = async () => [
+      { audioPath: join(root, 'quiet-section.webm'), batchIndex: 0, startSeconds: 0 },
+      { audioPath: join(root, 'loud-section.webm'), batchIndex: 1, startSeconds: 600 },
+    ];
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async (audioPath) => {
+        diarizeCalls += 1;
+        return { segments: [{ speaker: 'A', start: 0, end: 3, text: audioPath.includes('loud') ? 'Real speech' : 'Should never be called for the quiet section' }] };
+      },
+      summarize: async () => '{}',
+    }, segment, async (audioPath) => audioPath.includes('quiet') ? -60 : -20);
+
+    expect(diarizeCalls).toBe(1);
+    const saved = await store.get(meeting.id);
+    expect(saved?.finalTranscript.map((item) => item.text)).toEqual(['Real speech']);
+  });
+
+  it('collapses a hallucinated repetition loop in a diarized section into a single instance', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async () => ({ segments: [{ speaker: 'A', start: 0, end: 3, text: Array(50).fill('गिलते').join(' ') }] }),
+      summarize: async () => '{}',
+    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }], notSilent);
+
+    expect((await store.get(meeting.id))?.finalTranscript[0]?.text).toBe('गिलते');
+  });
+
+  it('collapses a hallucinated sentence repeated across separate diarized segments in one section', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async () => ({
+        segments: [
+          { speaker: 'B', start: 34, end: 35, text: "I didn't hear his own voice." },
+          { speaker: 'B', start: 35, end: 36, text: "I didn't hear his own voice." },
+          { speaker: 'B', start: 36, end: 37, text: "I didn't hear his own voice." },
+          { speaker: 'B', start: 40, end: 41, text: 'Real speech continues here.' },
+        ],
+      }),
+      summarize: async () => '{}',
+    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }], notSilent);
+
+    const saved = await store.get(meeting.id);
+    expect(saved?.finalTranscript.map((item) => item.text)).toEqual(["I didn't hear his own voice.", 'Real speech continues here.']);
+    expect(saved?.finalTranscript[0]).toMatchObject({ startSeconds: 34, endSeconds: 37 });
+  });
+
+  it('reconciles chunk-fragmented speaker labels into one canonical label per real person', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    const segment = async () => [
+      { audioPath: join(root, 'first.webm'), batchIndex: 0, startSeconds: 0 },
+      { audioPath: join(root, 'second.webm'), batchIndex: 1, startSeconds: 600 },
+    ];
+    const reconcileSpeakers = vi.fn(async () => ({ 'Speaker A': 'Speaker A', 'Speaker 2-A': 'Speaker A' }));
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async (audioPath) => ({ segments: [{ speaker: 'A', start: 0, end: audioPath.endsWith('first.webm') ? 10 : 5, text: audioPath.endsWith('first.webm') ? 'Hello' : 'World' }] }),
+      summarize: async () => JSON.stringify({ summary: 'Done', decisions: [], actionItems: [], openQuestions: [] }),
+      reconcileSpeakers,
+    }, segment, notSilent);
+
+    const saved = await store.get(meeting.id);
+    expect(reconcileSpeakers).toHaveBeenCalledWith(expect.any(String), ['Speaker 2-A', 'Speaker A']);
+    expect(saved?.finalTranscript.map((item) => item.speakerLabel)).toEqual(['Speaker A', 'Speaker A']);
+    expect(saved?.finalReport?.speakerStats).toEqual([{ speakerLabel: 'Speaker A', talkSeconds: 15 }]);
+  });
+
+  it('does not call reconcileSpeakers when only one distinct speaker label is present', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    const reconcileSpeakers = vi.fn(async () => ({}));
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async () => ({ segments: [{ speaker: 'A', start: 0, end: 3, text: 'Only speaker' }] }),
+      summarize: async () => '{}',
+      reconcileSpeakers,
+    }, async () => [{ audioPath: join(root, 'section.webm'), batchIndex: 0, startSeconds: 0 }], notSilent);
+
+    expect(reconcileSpeakers).not.toHaveBeenCalled();
+    expect((await store.get(meeting.id))?.finalTranscript[0]?.speakerLabel).toBe('Speaker A');
+  });
+
+  it('keeps the meeting successful with original labels when speaker reconciliation fails', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    const segment = async () => [
+      { audioPath: join(root, 'first.webm'), batchIndex: 0, startSeconds: 0 },
+      { audioPath: join(root, 'second.webm'), batchIndex: 1, startSeconds: 600 },
+    ];
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async (audioPath) => ({ segments: [{ speaker: 'A', start: 0, end: 3, text: audioPath.endsWith('first.webm') ? 'Hello' : 'World' }] }),
+      summarize: async () => JSON.stringify({ summary: 'Done', decisions: [], actionItems: [], openQuestions: [] }),
+      reconcileSpeakers: async () => { throw new Error('reconciliation unavailable'); },
+    }, segment, notSilent);
+
+    const saved = await store.get(meeting.id);
+    expect(saved?.status).toBe('ready');
+    expect(saved?.processingStage).toBe('final_ready');
+    expect(saved?.finalTranscript.map((item) => item.speakerLabel)).toEqual(['Speaker A', 'Speaker 2-A']);
+  });
+
+  it('logs when speaker reconciliation fails, so a silent failure is visible instead of just leaving unmerged labels', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    const segment = async () => [
+      { audioPath: join(root, 'first.webm'), batchIndex: 0, startSeconds: 0 },
+      { audioPath: join(root, 'second.webm'), batchIndex: 1, startSeconds: 600 },
+    ];
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async (audioPath) => ({ segments: [{ speaker: 'A', start: 0, end: 3, text: audioPath.endsWith('first.webm') ? 'Hello' : 'World' }] }),
+      summarize: async () => JSON.stringify({ summary: 'Done', decisions: [], actionItems: [], openQuestions: [] }),
+      reconcileSpeakers: async () => { throw new Error('reconciliation unavailable'); },
+    }, segment, notSilent);
+
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('Speaker reconciliation failed'), expect.any(Error));
+    consoleError.mockRestore();
+  });
+
+  it('ignores an invented speaker label in the reconciliation mapping while applying valid entries in the same mapping', async () => {
+    const { store, root, meeting } = await createTestMeeting();
+    await store.saveChunk(meeting.id, '0', Buffer.from('audio'));
+    const segment = async () => [
+      { audioPath: join(root, 'first.webm'), batchIndex: 0, startSeconds: 0 },
+      { audioPath: join(root, 'second.webm'), batchIndex: 1, startSeconds: 600 },
+      { audioPath: join(root, 'third.webm'), batchIndex: 2, startSeconds: 1200 },
+    ];
+
+    await processFinalDiarizedMeeting(store, meeting.id, root, {
+      diarize: async (audioPath) => {
+        const text = audioPath.endsWith('first.webm') ? 'Hello' : audioPath.endsWith('second.webm') ? 'World' : 'Third';
+        return { segments: [{ speaker: 'A', start: 0, end: 3, text }] };
+      },
+      summarize: async () => JSON.stringify({ summary: 'Done', decisions: [], actionItems: [], openQuestions: [] }),
+      reconcileSpeakers: async () => ({ 'Speaker A': 'Speaker A', 'Speaker 2-A': 'Speaker A', 'Speaker 3-A': 'Made Up Speaker' }),
+    }, segment, notSilent);
+
+    const saved = await store.get(meeting.id);
+    expect(saved?.finalTranscript.map((item) => item.speakerLabel)).toEqual(['Speaker A', 'Speaker A', 'Speaker 3-A']);
   });
 });

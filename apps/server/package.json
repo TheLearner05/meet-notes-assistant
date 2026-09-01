@@ -10,6 +10,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@azure/msal-node": "^2.16.2",
+    "docx": "^9.5.1",
+    "exceljs": "^4.4.0",
     "googleapis": "^170.1.0",
     "openai": "^6.24.1"
   },

@@ -5,16 +5,19 @@ import { join } from 'node:path';
 import OpenAI from 'openai';
 import type { MeetingLanguage, MeetingRecord, MeetingReport, MeetingStore, TranscriptSegment } from './meeting-store.js';
 import { retryTransient } from './processing-retry.js';
-import { openAiLanguageHints, openAiVocabulary } from './transcription-config.js';
+import { openAiLanguageCode, openAiVocabulary, transcriptionPrompt } from './transcription-config.js';
+import { collapseHallucinatedRepetition, collapseHallucinatedSegmentRepeats, isSilentSegment, measureMeanVolumeDb } from './transcription-quality.js';
 
 export type MeetingAi = {
   diarize: (audioPath: string, language: MeetingLanguage) => Promise<{ text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }>;
   summarize: (transcriptText: string) => Promise<string | null | undefined>;
   transcribe?: (audioPath: string, language: MeetingLanguage) => Promise<string>;
+  reconcileSpeakers?: (transcriptText: string, speakerLabels: string[]) => Promise<Record<string, string> | null | undefined>;
 };
 export type DiarizationAudioSegment = { audioPath: string; batchIndex: number; startSeconds: number };
 export type DiarizationSegmenter = (sourceAudioPath: string, audioDirectory: string, meetingId: string) => Promise<DiarizationAudioSegment[]>;
-export type ProvisionalProcessingOptions = { dataRoot?: string; transcribe?: (audioPath: string, language: MeetingLanguage) => Promise<string>; segmentAudio?: DiarizationSegmenter };
+export type VolumeMeasurer = (audioPath: string) => Promise<number | undefined>;
+export type ProvisionalProcessingOptions = { dataRoot?: string; transcribe?: (audioPath: string, language: MeetingLanguage) => Promise<string>; segmentAudio?: DiarizationSegmenter; measureVolume?: VolumeMeasurer };
 
 export function calculateSpeakerStats(segments: TranscriptSegment[]): { speakerLabel: string; talkSeconds: number }[] {
   const totals = new Map<string, number>();
@@ -32,19 +35,30 @@ function formatTranscriptDateTime(recordingStartedAt: string, segmentStartSecond
   return transcriptDateTime(recordingStartedAt, segmentStartSeconds).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 }
 
+// The OpenAI call behind `summarize` uses a strict json_schema response_format (see
+// MEETING_REPORT_SCHEMA below), so a successful, non-empty response is already guaranteed to
+// match this shape — no per-field re-validation needed. The fallback below only has to cover the
+// cases schema conformance can't: an empty/missing response, or JSON.parse failing outright.
 export function parseMeetingReport(content: string | null | undefined, transcript: TranscriptSegment[]): MeetingReport {
   const fallback: MeetingReport = { summary: 'The transcript was saved, but an AI summary was unavailable.', decisions: [], actionItems: [], openQuestions: [], speakerStats: calculateSpeakerStats(transcript) };
   if (!content?.trim()) return fallback;
   try {
-    const parsed = JSON.parse(content) as Partial<Omit<MeetingReport, 'speakerStats'>>;
-    return {
-      summary: typeof parsed.summary === 'string' && parsed.summary.trim() ? parsed.summary : fallback.summary,
-      decisions: Array.isArray(parsed.decisions) ? parsed.decisions.filter((item): item is string => typeof item === 'string') : [],
-      actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems.filter((item): item is MeetingReport['actionItems'][number] => Boolean(item) && typeof item === 'object' && typeof item.text === 'string') : [],
-      openQuestions: Array.isArray(parsed.openQuestions) ? parsed.openQuestions.filter((item): item is string => typeof item === 'string') : [],
-      speakerStats: fallback.speakerStats,
-    };
+    const parsed: unknown = JSON.parse(content);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fallback;
+    return { ...(parsed as Omit<MeetingReport, 'speakerStats'>), speakerStats: fallback.speakerStats };
   } catch { return fallback; }
+}
+
+// reconcileSpeakers can't use a strict json_schema object with dynamic keys (strict mode requires
+// a closed, named property set), so the model returns an array of {from, to} pairs instead; this
+// converts that array back into the Record<string, string> lookup the rest of the code expects.
+export function mappingsToRecord(mappings: { from?: unknown; to?: unknown }[] | null | undefined): Record<string, string> | undefined {
+  if (!Array.isArray(mappings)) return undefined;
+  const record: Record<string, string> = {};
+  for (const item of mappings) {
+    if (item && typeof item.from === 'string' && typeof item.to === 'string') record[item.from] = item.to;
+  }
+  return Object.keys(record).length ? record : undefined;
 }
 
 export function reportAsMarkdown(meeting: MeetingRecord): string {
@@ -64,7 +78,7 @@ export async function processProvisionalMeeting(store: MeetingStore, meetingId: 
     const meeting = await requireMeeting(store, meetingId);
     let transcript = meeting.provisionalTranscript;
     if (options.dataRoot && transcript.length < meeting.audioChunks.length) {
-      transcript = await rebuildProvisionalTranscript(store, meeting, options.dataRoot, options.transcribe ?? createOpenAiMeetingAi().transcribe!, options.segmentAudio ?? segmentFastTranscriptionAudio);
+      transcript = await rebuildProvisionalTranscript(store, meeting, options.dataRoot, options.transcribe ?? createOpenAiMeetingAi().transcribe!, options.segmentAudio ?? segmentFastTranscriptionAudio, options.measureVolume ?? measureMeanVolumeDb);
       await store.update(meetingId, (item) => { item.provisionalTranscript = transcript; });
     }
     if (!transcript.length) throw new Error('The recording did not contain transcribable speech.');
@@ -75,7 +89,7 @@ export async function processProvisionalMeeting(store: MeetingStore, meetingId: 
   }
 }
 
-export async function processFinalDiarizedMeeting(store: MeetingStore, meetingId: string, dataRoot: string, ai?: MeetingAi, segmentAudio: DiarizationSegmenter = segmentDiarizationAudio): Promise<void> {
+export async function processFinalDiarizedMeeting(store: MeetingStore, meetingId: string, dataRoot: string, ai?: MeetingAi, segmentAudio: DiarizationSegmenter = segmentDiarizationAudio, measureVolume: VolumeMeasurer = measureMeanVolumeDb): Promise<void> {
   try {
     const before = await requireMeeting(store, meetingId);
     if (!before.audioChunks.length) throw new Error('No audio was captured');
@@ -92,17 +106,19 @@ export async function processFinalDiarizedMeeting(store: MeetingStore, meetingId
       segments = await segmentAudio(sourceAudioPath, audioDirectory, meetingId);
       await store.update(meetingId, (item) => { item.processingProgress = { completed: 0, total: segments.length }; });
       const diarizedSections = await mapWithConcurrency(segments, 2, async (segment) => {
-        const result = await retryTransient(() => worker.diarize(segment.audioPath, meeting.language));
+        const skip = isSilentSegment(await measureVolume(segment.audioPath));
+        const result = skip ? {} : await retryTransient(() => worker.diarize(segment.audioPath, meeting.language));
         await store.update(meetingId, (item) => {
           const progress = item.processingProgress ?? { completed: 0, total: segments.length };
           item.processingProgress = { ...progress, completed: Math.min(progress.total, progress.completed + 1) };
         });
         return transcriptFromDiarizedResponse(result, segment.startSeconds, segment.batchIndex);
       });
-      transcript.push(...diarizedSections.flat());
+      transcript.push(...collapseHallucinatedSegmentRepeats(diarizedSections.flat()));
     } finally {
       await Promise.all([rm(sourceAudioPath, { force: true }), ...segments.map((segment) => rm(segment.audioPath, { force: true }))]);
     }
+    await reconcileSpeakerLabels(transcript, worker);
     if (!transcript.length) throw new Error('The recording did not contain transcribable speech.');
     const report = parseMeetingReport(await worker.summarize(transcriptAsText(transcript)), transcript);
     await store.update(meetingId, (item) => { item.finalTranscript = transcript; item.finalReport = report; item.transcript = transcript; item.report = report; item.status = 'ready'; item.processingStage = 'final_ready'; item.error = undefined; item.finalError = undefined; });
@@ -117,23 +133,92 @@ export async function processFinalDiarizedMeeting(store: MeetingStore, meetingId
 
 export async function processMeeting(store: MeetingStore, meetingId: string, dataRoot: string): Promise<void> { await processFinalDiarizedMeeting(store, meetingId, dataRoot); }
 
+// Strict structured outputs: OpenAI guarantees a successful response matches this shape exactly,
+// so callers (parseMeetingReport) don't need to re-validate individual fields. Strict mode requires
+// every property to be listed in `required` and `additionalProperties: false` on every object —
+// optional fields are modeled as nullable rather than omitted.
+const MEETING_REPORT_SCHEMA = {
+  name: 'meeting_report',
+  strict: true,
+  schema: {
+    type: 'object',
+    properties: {
+      summary: { type: 'string' },
+      decisions: { type: 'array', items: { type: 'string' } },
+      actionItems: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            text: { type: 'string' },
+            ownerSpeakerLabel: { type: ['string', 'null'] },
+            dueDate: { type: ['string', 'null'] },
+          },
+          required: ['text', 'ownerSpeakerLabel', 'dueDate'],
+          additionalProperties: false,
+        },
+      },
+      openQuestions: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['summary', 'decisions', 'actionItems', 'openQuestions'],
+    additionalProperties: false,
+  },
+} as const;
+// Strict mode can't express an object with dynamic/unknown keys (the speaker labels vary per
+// meeting), so the mapping travels as an array of {from, to} pairs instead of {label: label}.
+const SPEAKER_MAPPING_SCHEMA = {
+  name: 'speaker_mapping',
+  strict: true,
+  schema: {
+    type: 'object',
+    properties: {
+      mappings: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: { from: { type: 'string' }, to: { type: 'string' } },
+          required: ['from', 'to'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['mappings'],
+    additionalProperties: false,
+  },
+} as const;
+
 function createOpenAiMeetingAi(): MeetingAi {
   if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not configured');
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   return {
-    diarize: async (audioPath, language) => openai.audio.transcriptions.create({ file: createReadStream(audioPath), model: 'gpt-4o-transcribe-diarize', response_format: 'diarized_json', chunking_strategy: 'auto', ...(language === 'en' ? { language: 'en' } : {}) } as never) as unknown as Promise<{ text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }>,
+    diarize: async (audioPath, language) => openai.audio.transcriptions.create({ file: createReadStream(audioPath), model: 'gpt-4o-transcribe-diarize', response_format: 'diarized_json', chunking_strategy: 'auto', ...(openAiLanguageCode(language) ? { language: openAiLanguageCode(language) } : {}) } as never) as unknown as Promise<{ text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }>,
     summarize: async (transcriptText) => {
-      const completion = await openai.chat.completions.create({ model: process.env.OPENAI_SUMMARY_MODEL ?? 'gpt-4.1-mini', response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'Create an accurate English meeting report from the transcript. Return JSON with summary (string), decisions (string[]), actionItems ({text, ownerSpeakerLabel?, dueDate?}[]), and openQuestions (string[]). Do not invent decisions, owners, or due dates; use null for unknown due dates.' }, { role: 'user', content: transcriptText }] });
+      const completion = await openai.chat.completions.create({ model: process.env.OPENAI_SUMMARY_MODEL ?? 'gpt-4.1-mini', response_format: { type: 'json_schema', json_schema: MEETING_REPORT_SCHEMA }, messages: [{ role: 'system', content: 'Create an accurate English meeting report from the transcript. Do not invent decisions, owners, or due dates; use null for an unknown owner or due date.' }, { role: 'user', content: transcriptText }] });
       return completion.choices[0]?.message.content;
     },
+    reconcileSpeakers: async (transcriptText, speakerLabels) => {
+      const completion = await openai.chat.completions.create({ model: process.env.OPENAI_SUMMARY_MODEL ?? 'gpt-4.1-mini', response_format: { type: 'json_schema', json_schema: SPEAKER_MAPPING_SCHEMA }, messages: [{ role: 'system', content: `This transcript was diarized in separate chunks, so the same real speaker may appear under multiple different speaker labels (labels from later chunks carry a numeric prefix, e.g. "Speaker 2-A"). Using topic continuity, phrasing, and who is replying to whom, work out which labels refer to the same real person. The known speaker labels are: ${speakerLabels.join(', ')}. Return one {from, to} pair for every one of the known labels, where "to" is the canonical label to merge it into. Each "to" value must be reused verbatim from the known speaker labels above — never invent a new label.` }, { role: 'user', content: transcriptText }] });
+      const content = completion.choices[0]?.message.content;
+      if (!content?.trim()) return undefined;
+      try {
+        const parsed = JSON.parse(content) as { mappings?: unknown };
+        return mappingsToRecord(Array.isArray(parsed.mappings) ? parsed.mappings as { from?: unknown; to?: unknown }[] : undefined);
+      } catch { return undefined; }
+    },
     transcribe: async (audioPath, language) => {
-      const result = await openai.audio.transcriptions.create({ file: createReadStream(audioPath), model: 'gpt-transcribe', languages: openAiLanguageHints(language), keywords: openAiVocabulary() } as never) as unknown as { text?: string };
+      const prompt = transcriptionPrompt(language, openAiVocabulary());
+      const result = await openai.audio.transcriptions.create({
+        file: createReadStream(audioPath),
+        model: 'gpt-transcribe',
+        ...(openAiLanguageCode(language) ? { language: openAiLanguageCode(language) } : {}),
+        ...(prompt ? { prompt } : {}),
+      } as never) as unknown as { text?: string };
       return result.text ?? '';
     },
   };
 }
 
-async function rebuildProvisionalTranscript(store: MeetingStore, meeting: MeetingRecord, dataRoot: string, transcribe: (audioPath: string, language: MeetingLanguage) => Promise<string>, segmentAudio: DiarizationSegmenter): Promise<TranscriptSegment[]> {
+async function rebuildProvisionalTranscript(store: MeetingStore, meeting: MeetingRecord, dataRoot: string, transcribe: (audioPath: string, language: MeetingLanguage) => Promise<string>, segmentAudio: DiarizationSegmenter, measureVolume: VolumeMeasurer): Promise<TranscriptSegment[]> {
   const audioDirectory = join(dataRoot, 'audio');
   const sourceAudioPath = join(audioDirectory, `${meeting.id}-initial-source.webm`);
   const chunks = await Promise.all([...meeting.audioChunks].sort((left, right) => chunkSequence(left) - chunkSequence(right)).map((file) => readFile(store.audioFile(file))));
@@ -141,7 +226,10 @@ async function rebuildProvisionalTranscript(store: MeetingStore, meeting: Meetin
   let segments: DiarizationAudioSegment[] = [];
   try {
     segments = await segmentAudio(sourceAudioPath, audioDirectory, meeting.id);
-    const text = await mapWithConcurrency(segments, 2, async (segment) => (await transcribe(segment.audioPath, meeting.language)).trim());
+    const text = await mapWithConcurrency(segments, 2, async (segment) => {
+      if (isSilentSegment(await measureVolume(segment.audioPath))) return '';
+      return collapseHallucinatedRepetition((await transcribe(segment.audioPath, meeting.language)).trim());
+    });
     return segments.flatMap((segment, index) => text[index] ? [{ speakerLabel: 'Speaker pending', startSeconds: segment.startSeconds, endSeconds: segment.startSeconds + 600, text: text[index] }] : []);
   } finally {
     await Promise.all([rm(sourceAudioPath, { force: true }), ...segments.map((segment) => rm(segment.audioPath, { force: true }))]);
@@ -150,12 +238,44 @@ async function rebuildProvisionalTranscript(store: MeetingStore, meeting: Meetin
 
 function transcriptFromDiarizedResponse(transcription: { text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }, offsetSeconds: number, batchIndex: number): TranscriptSegment[] {
   const speakerPrefix = batchIndex ? `${batchIndex + 1}-` : '';
-  const transcript = (transcription.segments ?? []).map((segment, index) => ({ speakerLabel: `Speaker ${speakerPrefix}${segment.speaker ?? String.fromCharCode(65 + index % 26)}`, startSeconds: offsetSeconds + (segment.start ?? 0), endSeconds: offsetSeconds + (segment.end ?? 0), text: segment.text ?? '' }));
-  if (!transcript.length && transcription.text?.trim()) transcript.push({ speakerLabel: `Speaker ${speakerPrefix}A`, startSeconds: offsetSeconds, endSeconds: offsetSeconds, text: transcription.text.trim() });
+  const transcript = (transcription.segments ?? [])
+    .map((segment, index) => ({ speakerLabel: `Speaker ${speakerPrefix}${segment.speaker ?? String.fromCharCode(65 + index % 26)}`, startSeconds: offsetSeconds + (segment.start ?? 0), endSeconds: offsetSeconds + (segment.end ?? 0), text: collapseHallucinatedRepetition(segment.text ?? '') }))
+    .filter((segment) => segment.text);
+  if (!transcript.length && transcription.text?.trim()) transcript.push({ speakerLabel: `Speaker ${speakerPrefix}A`, startSeconds: offsetSeconds, endSeconds: offsetSeconds, text: collapseHallucinatedRepetition(transcription.text.trim()) });
   return transcript;
 }
+// Best-effort: OpenAI's diarization labels ("A", "B", ...) only carry meaning within a single chunk-level API
+// call, so the same real speaker can surface under several distinct labels across chunks. This reconciles those
+// chunk-fragmented labels into one canonical label per real person before stats/report generation, without ever
+// turning an otherwise-successful diarization into a failed meeting.
+async function reconcileSpeakerLabels(transcript: TranscriptSegment[], worker: MeetingAi): Promise<void> {
+  if (!transcript.length || !worker.reconcileSpeakers) return;
+  const knownLabels = [...new Set(transcript.map((segment) => segment.speakerLabel))].sort();
+  if (knownLabels.length <= 1) return;
+  try {
+    const mapping = await worker.reconcileSpeakers(transcriptAsText(transcript), knownLabels);
+    applySpeakerReconciliation(transcript, mapping, knownLabels);
+  } catch (error) {
+    // Reconciliation is a best-effort enhancement layered on top of already-successful diarization; leave the
+    // original, unmerged labels in place if it throws or returns something unusable. Still log it — a silently
+    // failing reconciliation looks identical to "these really are different speakers" otherwise.
+    console.error('Speaker reconciliation failed; keeping unmerged chunk-level labels.', error);
+  }
+}
+function applySpeakerReconciliation(transcript: TranscriptSegment[], mapping: Record<string, string> | null | undefined, knownLabels: string[]): void {
+  if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) return;
+  const knownLabelSet = new Set(knownLabels);
+  const validMapping = new Map<string, string>();
+  for (const [originalLabel, mappedLabel] of Object.entries(mapping)) {
+    if (typeof mappedLabel === 'string' && knownLabelSet.has(mappedLabel)) validMapping.set(originalLabel, mappedLabel);
+  }
+  for (const segment of transcript) {
+    const mappedLabel = validMapping.get(segment.speakerLabel);
+    if (mappedLabel) segment.speakerLabel = mappedLabel;
+  }
+}
 async function segmentDiarizationAudio(sourceAudioPath: string, audioDirectory: string, meetingId: string): Promise<DiarizationAudioSegment[]> {
-  return segmentAudioFile(sourceAudioPath, audioDirectory, meetingId, 'diarization', 600);
+  return segmentAudioFile(sourceAudioPath, audioDirectory, meetingId, 'diarization', 1200);
 }
 async function segmentFastTranscriptionAudio(sourceAudioPath: string, audioDirectory: string, meetingId: string): Promise<DiarizationAudioSegment[]> {
   return segmentAudioFile(sourceAudioPath, audioDirectory, meetingId, 'initial', 600);
@@ -172,8 +292,16 @@ async function runFfmpeg(args: string[]): Promise<void> {
     const process = spawn('ffmpeg', args, { windowsHide: true });
     let errorOutput = '';
     process.stderr.on('data', (chunk: Buffer) => { errorOutput += chunk.toString(); });
-    process.once('error', () => reject(new Error('FFmpeg is required to prepare longer recordings. Install FFmpeg, then retry this meeting.')));
+    process.once('error', () => reject(new Error('FFmpeg is required to prepare the speaker report. Install FFmpeg, then retry this meeting.')));
     process.once('close', (code) => code === 0 ? resolve() : reject(new Error(errorOutput.trim() || 'Could not prepare the recording for speaker analysis.')));
+  });
+}
+
+export async function checkFfmpegAvailable(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const process = spawn('ffmpeg', ['-version'], { windowsHide: true, timeout: 3000 });
+    process.once('error', () => resolve(false));
+    process.once('close', (code) => resolve(code === 0));
   });
 }
 function chunkSequence(file: string): number { return Number(file.match(/-(\d+)\.webm$/i)?.[1] ?? 0); }

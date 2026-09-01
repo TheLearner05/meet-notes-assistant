@@ -16,9 +16,19 @@ async function upload(blob: Blob): Promise<void> {
   if (!response.ok) throw new Error('Chunk upload failed');
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'OFFSCREEN_START') void start(message.meetingId, message.streamId);
   if (message.type === 'OFFSCREEN_STOP') void stop();
+  if (message.type === 'OFFSCREEN_PAUSE') {
+    if (recorder?.state === 'recording') recorder.pause();
+    sendResponse({ paused: recorder?.state === 'paused' });
+    return true;
+  }
+  if (message.type === 'OFFSCREEN_RESUME') {
+    if (recorder?.state === 'paused') recorder.resume();
+    sendResponse({ paused: recorder?.state === 'paused' });
+    return true;
+  }
 });
 
 async function start(id: string, streamId: string): Promise<void> {

@@ -1,17 +1,21 @@
-import { getMeetState } from './content/meet-detector.js';
-import { recordingStatusMessage, shouldAutoStopRecording, shouldShowRecordingPrompt } from './content/recording-prompt.js';
+import { getMeetState, getParticipantCount } from './content/meet-detector.js';
+import { recordingStatusMessage, shouldAutoStopForLoneParticipant, shouldAutoStopRecording, shouldShowRecordingPrompt } from './content/recording-prompt.js';
 
 let isRecording = false;
+let isPaused = false;
 let isSaving = false;
 let prompt: HTMLDivElement | undefined;
 let autoStopTimer: number | undefined;
 let savingBannerTimer: number | undefined;
+let aloneSince: number | undefined;
 const AUTO_STOP_GRACE_MS = 4000;
 const SAVING_BANNER_MS = 8000;
+const LONE_PARTICIPANT_GRACE_MS = 30000;
 
 function render(): void {
   const state = getMeetState(location.href, document);
   updateAutoStop(state);
+  updateLoneParticipantWatch(state);
   if (!shouldShowRecordingPrompt(state, isRecording || isSaving)) { prompt?.remove(); prompt = undefined; return; }
   if (prompt) return;
   prompt = document.createElement('div');
@@ -35,15 +39,41 @@ function updateAutoStop(state: ReturnType<typeof getMeetState>): void {
   }, AUTO_STOP_GRACE_MS);
 }
 
+// Covers everyone else leaving while the tab stays on the call (shouldAutoStopRecording only
+// catches navigating away from it). Runs off the same 2s render() poll as the rest of this file,
+// so aloneSince tracks wall-clock time rather than a timer the poll interval would otherwise skew.
+function updateLoneParticipantWatch(state: ReturnType<typeof getMeetState>): void {
+  if (state !== 'in-call' || !isRecording) { aloneSince = undefined; return; }
+  const participantCount = getParticipantCount(document);
+  if (participantCount !== 1) { aloneSince = undefined; return; }
+  if (aloneSince === undefined) aloneSince = Date.now();
+  if (shouldAutoStopForLoneParticipant(isRecording, participantCount, Date.now() - aloneSince, LONE_PARTICIPANT_GRACE_MS)) {
+    aloneSince = undefined;
+    chrome.runtime.sendMessage({ type: 'MEETING_ENDED' });
+  }
+}
+
 function showRecordingBanner(): void {
   isSaving = false;
   if (savingBannerTimer !== undefined) window.clearTimeout(savingBannerTimer);
   document.querySelector('#meet-notes-assistant-recording-status')?.remove();
   const banner = document.createElement('div');
   banner.id = 'meet-notes-assistant-recording-status';
-  banner.innerHTML = `<div role="status" aria-live="assertive" style="font:15px system-ui,sans-serif;position:fixed;z-index:2147483647;top:20px;left:50%;transform:translateX(-50%);width:min(440px,calc(100vw - 32px));box-sizing:border-box;padding:16px 18px;background:#b42318;color:white;border:2px solid #fff8;border-radius:13px;box-shadow:0 10px 32px #0007;text-align:center"><strong style="display:block;font-size:20px;letter-spacing:.4px">${recordingStatusMessage('on')}</strong><span style="display:block;margin:5px 0 12px">This Google Meet is being recorded</span><button style="width:100%;border:0;border-radius:7px;padding:9px;background:white;color:#8b171c;font-weight:800;cursor:pointer" id="mna-stop">STOP RECORDING</button></div>`;
+  const background = isPaused ? '#8a5a00' : '#b42318';
+  const description = isPaused ? 'Recording is paused for this Google Meet' : 'This Google Meet is being recorded';
+  const toggleLabel = isPaused ? 'RESUME' : 'PAUSE';
+  banner.innerHTML = `<div role="status" aria-live="assertive" style="font:15px system-ui,sans-serif;position:fixed;z-index:2147483647;top:20px;left:50%;transform:translateX(-50%);width:min(440px,calc(100vw - 32px));box-sizing:border-box;padding:16px 18px;background:${background};color:white;border:2px solid #fff8;border-radius:13px;box-shadow:0 10px 32px #0007;text-align:center"><strong style="display:block;font-size:20px;letter-spacing:.4px">${recordingStatusMessage(isPaused ? 'paused' : 'on')}</strong><span style="display:block;margin:5px 0 12px">${description}</span><div style="display:flex;gap:8px"><button style="flex:1;border:0;border-radius:7px;padding:9px;background:#fff3;color:white;font-weight:800;cursor:pointer" id="mna-toggle-pause">${toggleLabel}</button><button style="flex:1;border:0;border-radius:7px;padding:9px;background:white;color:#8b171c;font-weight:800;cursor:pointer" id="mna-stop">STOP RECORDING</button></div></div>`;
   document.documentElement.append(banner);
-  banner.querySelector<HTMLButtonElement>('#mna-stop')?.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'STOP_RECORDING' }, () => { isRecording = false; showSavingBanner(); render(); }));
+  banner.querySelector<HTMLButtonElement>('#mna-stop')?.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'STOP_RECORDING' }, () => { isRecording = false; isPaused = false; showSavingBanner(); render(); }));
+  const toggleButton = banner.querySelector<HTMLButtonElement>('#mna-toggle-pause');
+  toggleButton?.addEventListener('click', () => {
+    const requestedPause = !isPaused;
+    toggleButton.disabled = true;
+    chrome.runtime.sendMessage({ type: requestedPause ? 'PAUSE_RECORDING' : 'RESUME_RECORDING' }, (result: { ok?: boolean } | undefined) => {
+      if (result?.ok) isPaused = requestedPause;
+      showRecordingBanner();
+    });
+  });
 }
 
 function showSavingBanner(): void {
@@ -61,10 +91,13 @@ function showSavingBanner(): void {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.type === 'GET_MEET_STATE') { sendResponse({ state: getMeetState(location.href, document) }); return; }
-  if (message.type === 'RECORDING_STARTED') { isRecording = true; prompt?.remove(); prompt = undefined; showRecordingBanner(); render(); }
-  if (message.type === 'RECORDING_STOPPED') { isRecording = false; showSavingBanner(); render(); }
+  if (message.type === 'RECORDING_STARTED') { isRecording = true; isPaused = false; prompt?.remove(); prompt = undefined; showRecordingBanner(); render(); }
+  if (message.type === 'RECORDING_STOPPED') { isRecording = false; isPaused = false; showSavingBanner(); render(); }
 });
 
 new MutationObserver(render).observe(document.documentElement, { childList: true, subtree: true });
 setInterval(render, 2000);
-render();
+chrome.runtime.sendMessage({ type: 'GET_RECORDING_STATE' }, (result: { recording?: boolean; paused?: boolean } | undefined) => {
+  if (result?.recording) { isRecording = true; isPaused = result.paused === true; showRecordingBanner(); }
+  render();
+});

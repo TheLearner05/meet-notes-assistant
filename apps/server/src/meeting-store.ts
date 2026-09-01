@@ -23,6 +23,7 @@ export type MeetingRecord = {
   processingStage: MeetingProcessingStage;
   processingProgress?: MeetingProcessingProgress;
   createdAt: string;
+  updatedAt: string;
   endedAt?: string;
   rawAudioDeleteAfter: string;
   audioChunks: string[];
@@ -36,6 +37,9 @@ export type MeetingRecord = {
   finalError?: string;
   googleDocUrl?: string;
   error?: string;
+  forcedFinish?: 'manual' | 'stale-sweep';
+  microsoftExportError?: string;
+  microsoftTasksExported?: boolean;
 };
 
 export function createMeetingRecord(language: MeetingLanguage, now = new Date()): MeetingRecord {
@@ -47,12 +51,25 @@ export function createMeetingRecord(language: MeetingLanguage, now = new Date())
     processingStage: 'recording',
     processingProgress: { completed: 0, total: 0 },
     createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
     rawAudioDeleteAfter: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
     audioChunks: [],
     transcript: [],
     provisionalTranscript: [],
     finalTranscript: [],
   };
+}
+
+export const STALE_RECORDING_THRESHOLD_MS = 3 * 60 * 60 * 1000;
+
+export function isStaleRecording(
+  meeting: Pick<MeetingRecord, 'status' | 'createdAt'> & { updatedAt?: string },
+  now: Date,
+  thresholdMs = STALE_RECORDING_THRESHOLD_MS,
+): boolean {
+  if (meeting.status !== 'recording') return false;
+  const lastActivity = new Date(meeting.updatedAt ?? meeting.createdAt);
+  return now.getTime() - lastActivity.getTime() > thresholdMs;
 }
 
 export class MeetingStore {
@@ -80,13 +97,14 @@ export class MeetingStore {
     });
   }
 
+  // Routed through the same lock as writes so a read can never observe a torn/in-progress save.
   async list(query = ''): Promise<MeetingRecord[]> {
     const normalized = query.trim().toLowerCase();
-    return (await this.load()).filter((meeting) => meeting.status !== 'deleted' && (!normalized || JSON.stringify(meeting).toLowerCase().includes(normalized)));
+    return this.mutate(async () => (await this.load()).filter((meeting) => meeting.status !== 'deleted' && (!normalized || JSON.stringify(meeting).toLowerCase().includes(normalized))));
   }
 
   async get(id: string): Promise<MeetingRecord | undefined> {
-    return (await this.load()).find((meeting) => meeting.id === id && meeting.status !== 'deleted');
+    return this.mutate(async () => (await this.load()).find((meeting) => meeting.id === id && meeting.status !== 'deleted'));
   }
 
   async update(id: string, mutate: (meeting: MeetingRecord) => void): Promise<MeetingRecord> {
@@ -95,6 +113,7 @@ export class MeetingStore {
       const meeting = meetings.find((item) => item.id === id && item.status !== 'deleted');
       if (!meeting) throw new Error('Meeting not found');
       mutate(meeting);
+      meeting.updatedAt = new Date().toISOString();
       await this.save(meetings);
       return meeting;
     });
@@ -142,6 +161,7 @@ export class MeetingStore {
     return {
       ...meeting,
       processingStage,
+      updatedAt: meeting.updatedAt ?? meeting.createdAt,
       processingProgress: meeting.processingProgress ?? { completed: 0, total: 0 },
       provisionalTranscript: meeting.provisionalTranscript ?? [],
       finalTranscript: meeting.finalTranscript ?? (processingStage === 'final_ready' ? meeting.transcript : []),
