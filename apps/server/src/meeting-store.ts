@@ -19,6 +19,8 @@ export type MeetingRecord = {
   id: string;
   source: 'google-meet';
   language: MeetingLanguage;
+  title?: string;
+  userNotes?: string;
   status: MeetingStatus;
   processingStage: MeetingProcessingStage;
   processingProgress?: MeetingProcessingProgress;
@@ -42,11 +44,12 @@ export type MeetingRecord = {
   microsoftTasksExported?: boolean;
 };
 
-export function createMeetingRecord(language: MeetingLanguage, now = new Date()): MeetingRecord {
+export function createMeetingRecord(language: MeetingLanguage, now = new Date(), title?: string): MeetingRecord {
   return {
     id: randomUUID(),
     source: 'google-meet',
     language,
+    ...(title ? { title } : {}),
     status: 'recording',
     processingStage: 'recording',
     processingProgress: { completed: 0, total: 0 },
@@ -87,10 +90,10 @@ export class MeetingStore {
     try { await readFile(this.databasePath, 'utf8'); } catch { await this.save([]); }
   }
 
-  async create(language: MeetingLanguage): Promise<MeetingRecord> {
+  async create(language: MeetingLanguage, title?: string): Promise<MeetingRecord> {
     return this.mutate(async () => {
       const meetings = await this.load();
-      const meeting = createMeetingRecord(language);
+      const meeting = createMeetingRecord(language, new Date(), title);
       meetings.unshift(meeting);
       await this.save(meetings);
       return meeting;

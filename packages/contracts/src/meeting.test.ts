@@ -19,4 +19,18 @@ describe('createMeetingInputSchema', () => {
       createMeetingInputSchema.parse({ source: 'google-meet', language: 'fr' }),
     ).toThrow();
   });
+
+  it('accepts an optional meeting title', () => {
+    expect(
+      createMeetingInputSchema.parse({
+        source: 'google-meet',
+        language: 'en',
+        title: 'Sprint Planning',
+      }),
+    ).toEqual({
+      source: 'google-meet',
+      language: 'en',
+      title: 'Sprint Planning',
+    });
+  });
 });

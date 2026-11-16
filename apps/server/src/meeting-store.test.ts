@@ -27,6 +27,11 @@ describe('createMeetingRecord', () => {
     });
     expect(meeting.id).toMatch(/^[a-z0-9-]+$/);
   });
+
+  it('preserves an optional meeting title when provided', () => {
+    const meeting = createMeetingRecord('en', new Date('2026-08-19T10:00:00.000Z'), 'Sprint Retrospective');
+    expect(meeting.title).toBe('Sprint Retrospective');
+  });
 });
 
 describe('fast processing state', () => {
@@ -54,6 +59,27 @@ describe('fast processing state', () => {
         processingStage: 'transcribing_fast',
         error: 'Transient upload error',
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('searches meetings by title and user scratchpad notes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'meet-notes-store-'));
+    try {
+      const store = new MeetingStore(root);
+      await store.init();
+      const m1 = await store.create('en', 'Q4 Budget Review');
+      await store.update(m1.id, (item) => { item.userNotes = 'Approved 50k marketing spend'; });
+      await store.create('mr-en', 'Frontend Standup');
+
+      const byTitle = await store.list('budget');
+      expect(byTitle).toHaveLength(1);
+      expect(byTitle[0].id).toBe(m1.id);
+
+      const byNotes = await store.list('marketing spend');
+      expect(byNotes).toHaveLength(1);
+      expect(byNotes[0].id).toBe(m1.id);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

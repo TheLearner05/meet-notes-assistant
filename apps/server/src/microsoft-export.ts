@@ -10,7 +10,7 @@ export function isExportReady(meeting: Pick<MeetingRecord, 'processingStage' | '
 }
 
 function meetingTitle(meeting: MeetingRecord): string {
-  return `Meeting — ${new Date(meeting.createdAt).toLocaleString()}`;
+  return meeting.title ? `${meeting.title} — ${new Date(meeting.createdAt).toLocaleString()}` : `Meeting — ${new Date(meeting.createdAt).toLocaleString()}`;
 }
 
 async function matchTasksWithAi(meeting: MeetingRecord, openTasks: OpenTaskRow[]) {

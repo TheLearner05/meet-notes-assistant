@@ -1,21 +1,346 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Meet Notes Assistant</title><style>
-body{margin:0;font-family:system-ui,sans-serif;background:#f6f7fb;color:#152033}.shell{max-width:1120px;margin:auto;padding:32px 20px}header{display:flex;justify-content:space-between;align-items:center;gap:16px}h1{margin:0;font-size:28px}.hint{color:#5c6575}.grid{display:grid;grid-template-columns:340px 1fr;gap:18px;margin-top:24px}.card{background:#fff;border:1px solid #e5e8ef;border-radius:14px;padding:18px;box-shadow:0 3px 12px #15203308}.meeting{width:100%;text-align:left;border:0;border-bottom:1px solid #eef0f4;background:#fff;color:#152033;padding:14px 4px;cursor:pointer}.meeting:hover{background:#f7f9ff}.badge{font-size:12px;border-radius:10px;padding:3px 8px;background:#edf1ff;color:#354ca8}.actions{display:flex;gap:8px;flex-wrap:wrap}button,a.button{border:0;border-radius:8px;padding:9px 12px;background:#2947d3;color:#fff;font-weight:600;cursor:pointer;text-decoration:none}button.secondary{background:#edf0f6;color:#253044}button.danger{background:#b3261e}input{box-sizing:border-box;width:100%;padding:10px;border:1px solid #d9deea;border-radius:8px;margin:12px 0}section{margin-top:22px}ul{padding-left:20px}.transcript{white-space:pre-wrap;line-height:1.55;max-height:450px;overflow:auto;background:#f7f8fb;padding:14px;border-radius:8px}.empty{padding:40px 0;text-align:center;color:#667085}@media(max-width:760px){.grid{grid-template-columns:1fr}}
-</style></head><body><main class="shell"><header><div><h1>Meet Notes Assistant</h1><p class="hint">Private, post-meeting reports for Google Meet.</p></div><div style="text-align:right"><span id="health" class="badge">Checking service…</span><br><a id="microsoft-connect" href="/api/microsoft/connect" class="hint" style="display:none;margin-top:4px">Connect Microsoft 365</a></div></header><div class="grid"><aside class="card"><input id="search" placeholder="Search meetings, people, topics"><div id="meeting-list"></div></aside><article id="detail" class="card"><div class="empty">Select a meeting to view its report.</div></article></div><datalist id="known-speaker-names"></datalist></main><script type="module">
-import { processingStatusText } from './dashboard-status.js';
-const list=document.querySelector('#meeting-list'),detail=document.querySelector('#detail'),search=document.querySelector('#search');let selected;
-const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(path,options){const r=await fetch(path,options);const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error||'Request failed');return data}
-const stageMessage=processingStatusText;
-const bestReport=m=>m.finalReport??m.provisionalReport??m.report;
-const bestTranscript=m=>m.finalTranscript?.length?m.finalTranscript:m.provisionalTranscript?.length?m.provisionalTranscript:m.transcript||[];
-async function load(){const meetings=await api('/api/meetings?q='+encodeURIComponent(search.value));list.innerHTML=meetings.length?meetings.map(m=>`<button class="meeting" data-id="${m.id}"><strong>${new Date(m.createdAt).toLocaleString()}</strong><br><span class="badge">${esc(stageMessage(m))}</span> <span class="hint">${esc(m.language)}</span></button>`).join(''):'<p class="hint">No meetings yet. Start one from the extension.</p>';list.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>open(b.dataset.id));}
-async function open(id){selected=await api('/api/meetings/'+id);render();}
-function render(){const m=selected;if(!m)return;const r=bestReport(m),transcript=bestTranscript(m),isInitial=!m.finalReport&&Boolean(m.provisionalReport),notice=stageMessage(m),problem=m.error||(m.finalError?`The speaker report could not finish: ${m.finalError}`:'');detail.innerHTML=`<div class="actions"><span class="badge">${esc(notice)}</span><button class="secondary" id="refresh">Refresh</button>${m.status==='recording'?'<button id="finish-now">Finish recording now</button>':''}${(m.status==='failed'||m.finalError)?'<button id="retry">Retry processing</button>':''}${r?`<a class="button" href="/api/meetings/${m.id}/download">Download report</a><button id="export-doc">Export to Google Docs</button><button class="secondary" id="rename-speakers">Rename speakers</button>`:''}${m.googleDocUrl?`<a class="button" href="${esc(m.googleDocUrl)}" target="_blank">Open Google Doc</a>`:''}<button class="danger" id="delete">Delete meeting</button></div>${problem?`<p style="color:#b3261e">${esc(problem)}</p>`:''}${m.forcedFinish?`<p style="padding:10px 12px;background:#fff0e0;border-radius:8px">This recording was finished ${m.forcedFinish==='manual'?'manually':'automatically after a long period of inactivity'} instead of by the extension detecting the meeting ended. If the meeting was still going, this report may be missing whatever happened afterward.</p>`:''}${m.microsoftExportError?`<p class="hint" style="padding:10px 12px;background:#f7f8fb;border-radius:8px">Microsoft 365 export did not finish: ${esc(m.microsoftExportError)}</p>`:''}${!r?`<div class="empty">${esc(notice)} Refresh in a moment.</div>`:`${isInitial?'<p class="hint" style="padding:10px 12px;background:#fff7df;border-radius:8px">Initial notes are ready. Names and speaker times will appear after the final speaker-analysis pass.</p>':''}<div id="rename-form" style="display:none;padding:12px;background:#f7f8fb;border-radius:8px;margin-bottom:12px">${r.speakerStats.map(x=>`<label style="display:block;margin-top:8px">${esc(x.speakerLabel)}<input list="known-speaker-names" data-old="${esc(x.speakerLabel)}" placeholder="${esc(x.speakerLabel)}"></label>`).join('')}<div class="actions" style="margin-top:10px"><button id="save-speaker-names">Save names</button><button class="secondary" id="cancel-rename">Cancel</button></div></div><section><h2>Summary</h2><p>${esc(r.summary)}</p></section><section><h2>Decisions</h2><ul>${r.decisions.map(x=>'<li>'+esc(x)+'</li>').join('')||'<li>None stated</li>'}</ul></section><section><h2>Action items</h2><ul>${r.actionItems.map(x=>'<li>'+esc(x.text)+(x.ownerSpeakerLabel?' — '+esc(x.ownerSpeakerLabel):'')+(x.dueDate?' (due '+esc(x.dueDate)+')':'')+'</li>').join('')||'<li>None stated</li>'}</ul></section><section><h2>${isInitial?'Speaker labels':'Speaker report'}</h2><ul>${r.speakerStats.map(x=>'<li>'+esc(x.speakerLabel)+': '+Math.round(x.talkSeconds)+' seconds</li>').join('')}</ul></section><section><h2>Transcript</h2><div class="transcript">${transcript.map(x=>esc(x.speakerLabel)+' ['+esc(new Date(new Date(m.createdAt).getTime()+Math.max(0,x.startSeconds)*1000).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'medium'}))+'] '+esc(x.text)).join('\n\n')}</div></section>`}`;document.querySelector('#refresh').onclick=()=>open(m.id);document.querySelector('#finish-now')?.addEventListener('click',async()=>{if(!confirm('This ends the recording right now and builds the report from whatever was captured so far. Only do this if the recording is stuck (for example, the browser crashed) and will not finish on its own — if the meeting is still going, wait for it to end normally instead. Continue?'))return;try{await api('/api/meetings/'+m.id+'/finish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({manual:true})});await open(m.id);load()}catch(error){alert(error.message)}});document.querySelector('#retry')?.addEventListener('click',async()=>{try{await api('/api/meetings/'+m.id+'/retry',{method:'POST'});await open(m.id);load()}catch(error){alert(error.message)}});document.querySelector('#delete').onclick=async()=>{if(confirm('Delete this meeting and its recording?')){await api('/api/meetings/'+m.id,{method:'DELETE'});selected=null;detail.innerHTML='<div class="empty">Meeting deleted.</div>';load()}};document.querySelector('#export-doc')?.addEventListener('click',async()=>{try{const result=await api('/api/meetings/'+m.id+'/export/google-doc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'new'})});window.open(result.url,'_blank');open(m.id)}catch(error){if(confirm('Google Docs needs to be connected. Open the Google sign-in page now?'))location.href='/api/google/connect';else alert(error.message)}});const renameForm=document.querySelector('#rename-form');document.querySelector('#rename-speakers')?.addEventListener('click',()=>{if(renameForm)renameForm.style.display='block'});document.querySelector('#cancel-rename')?.addEventListener('click',()=>{if(renameForm)renameForm.style.display='none'});document.querySelector('#save-speaker-names')?.addEventListener('click',async()=>{const labels={};renameForm?.querySelectorAll('input[data-old]').forEach(input=>{const value=input.value.trim();if(value)labels[input.dataset.old]=value});if(!Object.keys(labels).length){if(renameForm)renameForm.style.display='none';return}try{await api('/api/meetings/'+m.id+'/speakers',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({labels})});await loadKnownSpeakers();await open(m.id)}catch(error){alert(error.message)}})}
-search.oninput=()=>load();
-async function loadKnownSpeakers(){const names=await api('/api/known-speakers').catch(()=>[]);document.querySelector('#known-speaker-names').innerHTML=names.map(name=>`<option value="${esc(name)}">`).join('')}
-async function refreshHealth(){const health=document.querySelector('#health');try{const h=await fetch('/api/health').then(r=>r.json());health.textContent=!h.openAiConfigured?'Add OPENAI_API_KEY':h.ffmpegAvailable===false?'Install FFmpeg for speaker reports':'OpenAI connected';health.style.cursor=h.openAiConfigured?'default':'pointer';health.onclick=h.openAiConfigured?null:async()=>{const key=prompt('Paste your OpenAI API key (from platform.openai.com/api-keys)');if(!key)return;try{await api('/api/settings/openai-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apiKey:key})});refreshHealth()}catch(error){alert(error.message)}};if(h.microsoftConfigured)document.querySelector('#microsoft-connect').style.display='inline'}catch{health.textContent='Server unavailable'}}
-refreshHealth();
-load();
-loadKnownSpeakers();
-</script></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Meet Notes Assistant</title>
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #f6f7fb; color: #152033; }
+    .shell { max-width: 1160px; margin: auto; padding: 28px 20px; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; }
+    h1 { margin: 0; font-size: 26px; }
+    .hint { color: #5c6575; font-size: 14px; }
+    .grid { display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
+    .card { background: #fff; border: 1px solid #e5e8ef; border-radius: 14px; padding: 20px; box-shadow: 0 3px 12px #15203308; }
+    .meeting { width: 100%; text-align: left; border: 0; border-bottom: 1px solid #eef0f4; background: #fff; color: #152033; padding: 12px 6px; cursor: pointer; transition: background 0.15s; }
+    .meeting:hover { background: #f4f6fc; }
+    .meeting.selected { background: #edf2ff; border-left: 3px solid #2947d3; }
+    .badge { font-size: 11px; font-weight: 600; border-radius: 8px; padding: 3px 8px; background: #edf1ff; color: #354ca8; display: inline-block; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+    button, a.button { border: 0; border-radius: 8px; padding: 8px 14px; background: #2947d3; color: #fff; font-weight: 600; font-size: 13px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+    button.secondary { background: #edf0f6; color: #253044; }
+    button.danger { background: #b3261e; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    input { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #d9deea; border-radius: 8px; margin-bottom: 12px; font-size: 14px; }
+    section { margin-top: 22px; }
+    section h2 { font-size: 17px; margin-bottom: 8px; color: #101828; }
+    ul { padding-left: 20px; margin: 6px 0; }
+    li { margin-bottom: 4px; line-height: 1.45; }
+    .transcript { max-height: 440px; overflow-y: auto; background: #f8f9fc; padding: 12px; border-radius: 10px; border: 1px solid #e9ebf2; }
+    .transcript-row { padding: 6px 8px; border-radius: 6px; line-height: 1.5; cursor: pointer; transition: background 0.1s; }
+    .transcript-row:hover { background: #e8ecf8; }
+    .transcript-row.active { background: #dce4fc; border-left: 3px solid #2947d3; }
+    .time-badge { font-size: 11px; color: #475467; background: #eaecf0; padding: 2px 6px; border-radius: 4px; font-variant-numeric: tabular-nums; }
+    .audio-bar { margin: 16px 0; padding: 10px 14px; background: #f0f4ff; border: 1px solid #d4e0fc; border-radius: 10px; display: flex; align-items: center; gap: 12px; }
+    .audio-bar audio { flex: 1; height: 34px; }
+    .scratchpad-box { white-space: pre-wrap; background: #fffcf0; border: 1px solid #f6e5a6; color: #694103; padding: 12px 14px; border-radius: 9px; line-height: 1.5; font-size: 14px; }
+    .empty { padding: 48px 0; text-align: center; color: #667085; }
+    @media(max-width: 780px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>Meet Notes Assistant</h1>
+        <p class="hint">Private, consent-first meeting intelligence for Google Meet.</p>
+      </div>
+      <div style="text-align: right">
+        <span id="health" class="badge">Checking service…</span><br>
+        <a id="microsoft-connect" href="/api/microsoft/connect" class="hint" style="display: none; margin-top: 4px">Connect Microsoft 365</a>
+      </div>
+    </header>
+
+    <div class="grid">
+      <aside class="card">
+        <input id="search" placeholder="Search meetings, topics, notes…">
+        <div id="meeting-list"></div>
+      </aside>
+
+      <article id="detail" class="card">
+        <div class="empty">Select a meeting to view its report.</div>
+      </article>
+    </div>
+
+    <datalist id="known-speaker-names"></datalist>
+  </main>
+
+  <script type="module">
+    import { processingStatusText } from './dashboard-status.js';
+
+    const list = document.querySelector('#meeting-list');
+    const detail = document.querySelector('#detail');
+    const search = document.querySelector('#search');
+    let selected;
+
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    
+    function formatTime(seconds) {
+      const s = Math.max(0, Math.floor(seconds || 0));
+      const m = Math.floor(s / 60);
+      const rem = s % 60;
+      return `${m}:${rem.toString().padStart(2, '0')}`;
+    }
+
+    async function api(path, options) {
+      const r = await fetch(path, options);
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || 'Request failed');
+      return data;
+    }
+
+    const stageMessage = processingStatusText;
+    const bestReport = (m) => m.finalReport ?? m.provisionalReport ?? m.report;
+    const bestTranscript = (m) => (m.finalTranscript?.length ? m.finalTranscript : m.provisionalTranscript?.length ? m.provisionalTranscript : m.transcript || []);
+
+    async function load() {
+      const meetings = await api('/api/meetings?q=' + encodeURIComponent(search.value));
+      list.innerHTML = meetings.length
+        ? meetings.map((m) => `
+          <button class="meeting ${selected?.id === m.id ? 'selected' : ''}" data-id="${m.id}">
+            <strong>${esc(m.title || 'Meeting')}</strong><br>
+            <span class="hint" style="font-size:12px">${new Date(m.createdAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}</span><br>
+            <span class="badge" style="margin-top:4px">${esc(stageMessage(m))}</span>
+            <span class="hint" style="font-size:11px; margin-left:4px">${esc(m.language)}</span>
+          </button>
+        `).join('')
+        : '<p class="hint" style="padding:12px 0">No meetings found. Start one from the Google Meet extension.</p>';
+
+      list.querySelectorAll('[data-id]').forEach((b) => (b.onclick = () => open(b.dataset.id)));
+    }
+
+    async function open(id) {
+      selected = await api('/api/meetings/' + id);
+      render();
+      load();
+    }
+
+    function render() {
+      const m = selected;
+      if (!m) return;
+      const r = bestReport(m);
+      const transcript = bestTranscript(m);
+      const isInitial = !m.finalReport && Boolean(m.provisionalReport);
+      const notice = stageMessage(m);
+      const problem = m.error || (m.finalError ? `The speaker report could not finish: ${m.finalError}` : '');
+      const hasAudio = Boolean(m.audioChunks?.length);
+
+      detail.innerHTML = `
+        <div class="actions">
+          <span class="badge">${esc(notice)}</span>
+          <button class="secondary" id="refresh">↻ Refresh</button>
+          ${m.status === 'recording' ? '<button id="finish-now">Finish recording now</button>' : ''}
+          ${m.status === 'failed' || m.finalError ? '<button id="retry">Retry processing</button>' : ''}
+          ${r ? `
+            <a class="button" href="/api/meetings/${m.id}/download">⬇ Download Markdown</a>
+            <button id="export-doc">Export to Google Docs</button>
+            <button class="secondary" id="rename-speakers">Rename speakers</button>
+          ` : ''}
+          ${m.googleDocUrl ? `<a class="button" href="${esc(m.googleDocUrl)}" target="_blank">Open Google Doc</a>` : ''}
+          <button class="danger" id="delete">Delete meeting</button>
+        </div>
+
+        <div style="margin-bottom:14px">
+          <h2 style="margin:0 0 4px; font-size:22px">${esc(m.title || 'Meeting report')}</h2>
+          <span class="hint">${new Date(m.createdAt).toLocaleString(undefined, { dateStyle: 'full', timeStyle: 'medium' })}</span>
+        </div>
+
+        ${hasAudio ? `
+          <div class="audio-bar">
+            <span style="font-size:13px; font-weight:600">▶ Audio:</span>
+            <audio id="meeting-audio" controls src="/api/meetings/${m.id}/audio"></audio>
+          </div>
+        ` : ''}
+
+        ${problem ? `<p style="color:#b3261e; font-weight:600">${esc(problem)}</p>` : ''}
+        ${m.forcedFinish ? `<p style="padding:10px 12px;background:#fff0e0;border-radius:8px;font-size:13px">This recording was finished ${m.forcedFinish === 'manual' ? 'manually' : 'automatically after a period of inactivity'}.</p>` : ''}
+        ${m.microsoftExportError ? `<p class="hint" style="padding:8px 12px;background:#f7f8fb;border-radius:8px">Microsoft 365 export did not finish: ${esc(m.microsoftExportError)}</p>` : ''}
+
+        ${!r ? `<div class="empty">${esc(notice)} Refresh in a moment.</div>` : `
+          ${isInitial ? '<p class="hint" style="padding:10px 12px;background:#fff7df;border-radius:8px">Initial notes are ready. Speaker labels and talk-time stats will update once final diarization completes.</p>' : ''}
+
+          <div id="rename-form" style="display:none;padding:14px;background:#f7f8fb;border-radius:8px;margin-bottom:14px;border:1px solid #e0e4ef">
+            <h3 style="margin:0 0 8px;font-size:15px">Rename Speakers</h3>
+            ${r.speakerStats.map((x) => `
+              <label style="display:block;margin-top:8px;font-size:13px">
+                ${esc(x.speakerLabel)}:
+                <input list="known-speaker-names" data-old="${esc(x.speakerLabel)}" placeholder="Assign name..." style="margin-top:3px">
+              </label>
+            `).join('')}
+            <div class="actions" style="margin-top:10px">
+              <button id="save-speaker-names">Save names</button>
+              <button class="secondary" id="cancel-rename">Cancel</button>
+            </div>
+          </div>
+
+          ${m.userNotes ? `
+            <section>
+              <h2>📝 In-Meeting Scratchpad Notes</h2>
+              <div class="scratchpad-box">${esc(m.userNotes)}</div>
+            </section>
+          ` : ''}
+
+          <section>
+            <h2>Summary</h2>
+            <p style="line-height:1.6;font-size:15px">${esc(r.summary)}</p>
+          </section>
+
+          <section>
+            <h2>Decisions</h2>
+            <ul>${r.decisions.map((x) => '<li>' + esc(x) + '</li>').join('') || '<li>None stated</li>'}</ul>
+          </section>
+
+          <section>
+            <h2>Action items</h2>
+            <ul>${r.actionItems.map((x) => '<li><strong>' + esc(x.text) + '</strong>' + (x.ownerSpeakerLabel ? ' — <em>' + esc(x.ownerSpeakerLabel) + '</em>' : '') + (x.dueDate ? ' (due ' + esc(x.dueDate) + ')' : '') + '</li>').join('') || '<li>None stated</li>'}</ul>
+          </section>
+
+          <section>
+            <h2>${isInitial ? 'Speaker labels' : 'Speaker breakdown'}</h2>
+            <ul>${r.speakerStats.map((x) => '<li><strong>' + esc(x.speakerLabel) + '</strong>: ' + Math.round(x.talkSeconds) + ' seconds</li>').join('')}</ul>
+          </section>
+
+          <section>
+            <h2>Transcript <span class="hint" style="font-size:12px; font-weight:normal">(click any line to play audio)</span></h2>
+            <div class="transcript" id="transcript-container">
+              ${transcript.map((x) => `
+                <div class="transcript-row" data-start="${x.startSeconds}">
+                  <span class="time-badge">${formatTime(x.startSeconds)}</span>
+                  <strong>${esc(x.speakerLabel)}:</strong>
+                  <span>${esc(x.text)}</span>
+                </div>
+              `).join('')}
+            </div>
+          </section>
+        `}
+      `;
+
+      // Wire up buttons
+      document.querySelector('#refresh').onclick = () => open(m.id);
+
+      const audioElement = document.querySelector('#meeting-audio');
+      document.querySelectorAll('.transcript-row').forEach((row) => {
+        row.addEventListener('click', () => {
+          if (!audioElement) return;
+          const startSeconds = Number(row.getAttribute('data-start'));
+          audioElement.currentTime = startSeconds;
+          audioElement.play().catch(() => {});
+          document.querySelectorAll('.transcript-row').forEach((r) => r.classList.remove('active'));
+          row.classList.add('active');
+        });
+      });
+
+      document.querySelector('#finish-now')?.addEventListener('click', async () => {
+        if (!confirm('This ends the recording right now and builds the report from whatever was captured so far. Continue?')) return;
+        try {
+          await api('/api/meetings/' + m.id + '/finish', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ manual: true }) });
+          await open(m.id);
+          load();
+        } catch (error) {
+          alert(error.message);
+        }
+      });
+
+      document.querySelector('#retry')?.addEventListener('click', async () => {
+        try {
+          await api('/api/meetings/' + m.id + '/retry', { method: 'POST' });
+          await open(m.id);
+          load();
+        } catch (error) {
+          alert(error.message);
+        }
+      });
+
+      document.querySelector('#delete').onclick = async () => {
+        if (confirm('Delete this meeting and its recording?')) {
+          await api('/api/meetings/' + m.id, { method: 'DELETE' });
+          selected = null;
+          detail.innerHTML = '<div class="empty">Meeting deleted.</div>';
+          load();
+        }
+      };
+
+      document.querySelector('#export-doc')?.addEventListener('click', async () => {
+        try {
+          const result = await api('/api/meetings/' + m.id + '/export/google-doc', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'new' }),
+          });
+          window.open(result.url, '_blank');
+          open(m.id);
+        } catch (error) {
+          if (confirm('Google Docs needs to be connected. Open the Google sign-in page now?')) {
+            location.href = '/api/google/connect';
+          } else {
+            alert(error.message);
+          }
+        }
+      });
+
+      const renameForm = document.querySelector('#rename-form');
+      document.querySelector('#rename-speakers')?.addEventListener('click', () => {
+        if (renameForm) renameForm.style.display = 'block';
+      });
+      document.querySelector('#cancel-rename')?.addEventListener('click', () => {
+        if (renameForm) renameForm.style.display = 'none';
+      });
+      document.querySelector('#save-speaker-names')?.addEventListener('click', async () => {
+        const labels = {};
+        renameForm?.querySelectorAll('input[data-old]').forEach((input) => {
+          const value = input.value.trim();
+          if (value) labels[input.dataset.old] = value;
+        });
+        if (!Object.keys(labels).length) {
+          if (renameForm) renameForm.style.display = 'none';
+          return;
+        }
+        try {
+          await api('/api/meetings/' + m.id + '/speakers', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ labels }),
+          });
+          await loadKnownSpeakers();
+          await open(m.id);
+        } catch (error) {
+          alert(error.message);
+        }
+      });
+    }
+
+    search.oninput = () => load();
+
+    async function loadKnownSpeakers() {
+      const names = await api('/api/known-speakers').catch(() => []);
+      document.querySelector('#known-speaker-names').innerHTML = names.map((name) => `<option value="${esc(name)}">`).join('');
+    }
+
+    async function refreshHealth() {
+      const health = document.querySelector('#health');
+      try {
+        const h = await fetch('/api/health').then((r) => r.json());
+        health.textContent = !h.openAiConfigured ? 'Add OPENAI_API_KEY' : h.ffmpegAvailable === false ? 'Install FFmpeg for speaker reports' : 'OpenAI connected';
+        health.style.cursor = h.openAiConfigured ? 'default' : 'pointer';
+        health.onclick = h.openAiConfigured ? null : async () => {
+          const key = prompt('Paste your OpenAI API key (from platform.openai.com/api-keys)');
+          if (!key) return;
+          try {
+            await api('/api/settings/openai-key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: key }) });
+            refreshHealth();
+          } catch (error) {
+            alert(error.message);
+          }
+        };
+        if (h.microsoftConfigured) document.querySelector('#microsoft-connect').style.display = 'inline';
+      } catch {
+        health.textContent = 'Server unavailable';
+      }
+    }
+
+    refreshHealth();
+    load();
+    loadKnownSpeakers();
+  </script>
+</body>
+</html>

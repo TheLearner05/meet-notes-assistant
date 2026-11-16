@@ -14,6 +14,7 @@ export const meetingStatusSchema = z.enum([
 export const createMeetingInputSchema = z.object({
   source: z.literal('google-meet'),
   language: meetingLanguageSchema,
+  title: z.string().optional(),
 });
 
 export type MeetingLanguage = z.infer<typeof meetingLanguageSchema>;

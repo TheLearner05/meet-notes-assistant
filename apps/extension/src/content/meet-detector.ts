@@ -41,3 +41,41 @@ export function getParticipantCount(document: Document): number | undefined {
 
   return undefined;
 }
+
+export function getMeetingTitle(url: string, document: Document): string | undefined {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return undefined;
+  }
+
+  if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname !== GOOGLE_MEET_HOST) {
+    return undefined;
+  }
+
+  // 1. Check DOM attribute
+  const titleAttr = document.querySelector('[data-meeting-title]')?.getAttribute('data-meeting-title')?.trim();
+  if (titleAttr) return titleAttr;
+
+  // 2. Check DOM element
+  const titleElem = document.querySelector('.u6vdEc, [data-self-name="meeting-title"]')?.textContent?.trim();
+  if (titleElem) return titleElem;
+
+  // 3. Check document.title pattern (e.g. "Meet - Sprint Planning - Google Chrome" or "Meet - Project Sync")
+  const docTitle = document.title?.trim();
+  if (docTitle) {
+    const match = docTitle.match(/^Meet\s*[-–—]\s*(.+?)(?:\s*[-–—]\s*Google Chrome)?$/i);
+    if (match && match[1]?.trim()) {
+      return match[1].trim();
+    }
+  }
+
+  // 4. Fallback to meeting code from URL (e.g. "abc-defg-hij")
+  const code = parsedUrl.pathname.replace(/^\//, '').split('/')[0]?.trim();
+  if (code && /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/i.test(code)) {
+    return code;
+  }
+
+  return undefined;
+}

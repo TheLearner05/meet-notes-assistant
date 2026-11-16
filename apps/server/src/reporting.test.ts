@@ -383,4 +383,27 @@ describe('fast and final reports', () => {
     const saved = await store.get(meeting.id);
     expect(saved?.finalTranscript.map((item) => item.speakerLabel)).toEqual(['Speaker A', 'Speaker A', 'Speaker 3-A']);
   });
+
+  it('formats markdown with title and attendee scratchpad notes', async () => {
+    const { store, meeting } = await createTestMeeting();
+    await store.update(meeting.id, (item) => {
+      item.title = 'Sprint Planning & Backlog Grooming';
+      item.userNotes = '- Discuss sprint velocity\n- Finalize ticket #402';
+      item.status = 'ready';
+      item.report = {
+        summary: 'Sprint planning discussion.',
+        decisions: ['Approved sprint backlog'],
+        actionItems: [{ text: 'Assign ticket 402', ownerSpeakerLabel: 'Speaker A', dueDate: null }],
+        openQuestions: [],
+        speakerStats: [{ speakerLabel: 'Speaker A', talkSeconds: 15 }],
+      };
+      item.transcript = [{ speakerLabel: 'Speaker A', startSeconds: 0, endSeconds: 15, text: 'Let us start.' }];
+    });
+
+    const markdown = reportAsMarkdown((await store.get(meeting.id))!);
+    expect(markdown).toContain('# Sprint Planning & Backlog Grooming');
+    expect(markdown).toContain('## Attendee scratchpad notes');
+    expect(markdown).toContain('Discuss sprint velocity');
+    expect(markdown).toContain('## Decisions\n- Approved sprint backlog');
+  });
 });

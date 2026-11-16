@@ -10,7 +10,7 @@ import { collapseHallucinatedRepetition, collapseHallucinatedSegmentRepeats, isS
 
 export type MeetingAi = {
   diarize: (audioPath: string, language: MeetingLanguage) => Promise<{ text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }>;
-  summarize: (transcriptText: string) => Promise<string | null | undefined>;
+  summarize: (transcriptText: string, userNotes?: string) => Promise<string | null | undefined>;
   transcribe?: (audioPath: string, language: MeetingLanguage) => Promise<string>;
   reconcileSpeakers?: (transcriptText: string, speakerLabels: string[]) => Promise<Record<string, string> | null | undefined>;
 };
@@ -66,12 +66,14 @@ export function reportAsMarkdown(meeting: MeetingRecord): string {
   const transcript = meeting.finalTranscript.length ? meeting.finalTranscript : meeting.provisionalTranscript.length ? meeting.provisionalTranscript : meeting.transcript;
   const isInitial = !meeting.finalReport && Boolean(meeting.provisionalReport);
   if (!report) return '# Meeting report\n\nThe report is not ready yet.';
+  const heading = meeting.title ? `# ${meeting.title}\n\n` : '# Meeting report\n\n';
   const actions = report.actionItems.map((item) => `- ${item.text}${item.ownerSpeakerLabel ? ` — ${item.ownerSpeakerLabel}` : ''}${item.dueDate ? ` (due ${item.dueDate})` : ''}`).join('\n') || '- None stated';
   const formattedTranscript = transcript.map((item) => `**${item.speakerLabel}** [${formatTranscriptDateTime(meeting.createdAt, item.startSeconds)}] ${item.text}`).join('\n\n');
-  return `# Meeting report\n\n${isInitial ? '## Initial notes — speaker attribution pending\n\n' : ''}## Summary\n${report.summary}\n\n## Decisions\n${report.decisions.map((item) => `- ${item}`).join('\n') || '- None stated'}\n\n## Action items\n${actions}\n\n## Open questions\n${report.openQuestions.map((item) => `- ${item}`).join('\n') || '- None stated'}\n\n## Speaker report\n${report.speakerStats.map((item) => `- ${item.speakerLabel}: ${Math.round(item.talkSeconds)} seconds`).join('\n')}\n\n## Transcript\n${formattedTranscript}`;
+  const userNotesSection = meeting.userNotes ? `## Attendee scratchpad notes\n${meeting.userNotes}\n\n` : '';
+  return `${heading}${isInitial ? '## Initial notes — speaker attribution pending\n\n' : ''}${userNotesSection}## Summary\n${report.summary}\n\n## Decisions\n${report.decisions.map((item) => `- ${item}`).join('\n') || '- None stated'}\n\n## Action items\n${actions}\n\n## Open questions\n${report.openQuestions.map((item) => `- ${item}`).join('\n') || '- None stated'}\n\n## Speaker report\n${report.speakerStats.map((item) => `- ${item.speakerLabel}: ${Math.round(item.talkSeconds)} seconds`).join('\n')}\n\n## Transcript\n${formattedTranscript}`;
 }
 
-export async function processProvisionalMeeting(store: MeetingStore, meetingId: string, flushChunks: (meetingId: string) => Promise<void>, summarize?: (transcriptText: string) => Promise<string | null | undefined>, options: ProvisionalProcessingOptions = {}): Promise<void> {
+export async function processProvisionalMeeting(store: MeetingStore, meetingId: string, flushChunks: (meetingId: string) => Promise<void>, summarize?: (transcriptText: string, userNotes?: string) => Promise<string | null | undefined>, options: ProvisionalProcessingOptions = {}): Promise<void> {
   try {
     await store.update(meetingId, (item) => { item.status = 'processing'; item.processingStage = 'transcribing_fast'; item.error = undefined; item.provisionalError = undefined; });
     await flushChunks(meetingId);
@@ -82,7 +84,7 @@ export async function processProvisionalMeeting(store: MeetingStore, meetingId: 
       await store.update(meetingId, (item) => { item.provisionalTranscript = transcript; });
     }
     if (!transcript.length) throw new Error('The recording did not contain transcribable speech.');
-    const report = parseMeetingReport(await (summarize ?? createOpenAiMeetingAi().summarize)(transcriptAsText(transcript)), transcript);
+    const report = parseMeetingReport(await (summarize ?? createOpenAiMeetingAi().summarize)(transcriptAsText(transcript), meeting.userNotes), transcript);
     await store.update(meetingId, (item) => { item.provisionalReport = report; item.report = report; item.transcript = transcript; item.status = 'ready'; item.processingStage = 'initial_ready'; item.error = undefined; });
   } catch (error) {
     await store.update(meetingId, (item) => { item.status = 'failed'; item.processingStage = 'failed'; item.error = errorMessage(error); item.provisionalError = item.error; });
@@ -120,7 +122,7 @@ export async function processFinalDiarizedMeeting(store: MeetingStore, meetingId
     }
     await reconcileSpeakerLabels(transcript, worker);
     if (!transcript.length) throw new Error('The recording did not contain transcribable speech.');
-    const report = parseMeetingReport(await worker.summarize(transcriptAsText(transcript)), transcript);
+    const report = parseMeetingReport(await worker.summarize(transcriptAsText(transcript), meeting.userNotes), transcript);
     await store.update(meetingId, (item) => { item.finalTranscript = transcript; item.finalReport = report; item.transcript = transcript; item.report = report; item.status = 'ready'; item.processingStage = 'final_ready'; item.error = undefined; item.finalError = undefined; });
   } catch (error) {
     const message = errorMessage(error);
@@ -192,8 +194,18 @@ function createOpenAiMeetingAi(): MeetingAi {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   return {
     diarize: async (audioPath, language) => openai.audio.transcriptions.create({ file: createReadStream(audioPath), model: 'gpt-4o-transcribe-diarize', response_format: 'diarized_json', chunking_strategy: 'auto', ...(openAiLanguageCode(language) ? { language: openAiLanguageCode(language) } : {}) } as never) as unknown as Promise<{ text?: string; segments?: { speaker?: string; start?: number; end?: number; text?: string }[] }>,
-    summarize: async (transcriptText) => {
-      const completion = await openai.chat.completions.create({ model: process.env.OPENAI_SUMMARY_MODEL ?? 'gpt-4.1-mini', response_format: { type: 'json_schema', json_schema: MEETING_REPORT_SCHEMA }, messages: [{ role: 'system', content: 'Create an accurate English meeting report from the transcript. Do not invent decisions, owners, or due dates; use null for an unknown owner or due date.' }, { role: 'user', content: transcriptText }] });
+    summarize: async (transcriptText, userNotes) => {
+      const systemPrompt = userNotes?.trim()
+        ? 'Create an accurate English meeting report from the transcript and the attendee scratchpad notes. Give strong priority to topics, decisions, and action items noted in the attendee notes, cross-referencing against the spoken transcript. Do not invent decisions, owners, or due dates; use null for an unknown owner or due date.'
+        : 'Create an accurate English meeting report from the transcript. Do not invent decisions, owners, or due dates; use null for an unknown owner or due date.';
+      const userContent = userNotes?.trim()
+        ? `Attendee scratchpad notes:\n${userNotes.trim()}\n\nTranscript:\n${transcriptText}`
+        : transcriptText;
+      const completion = await openai.chat.completions.create({
+        model: process.env.OPENAI_SUMMARY_MODEL ?? 'gpt-4.1-mini',
+        response_format: { type: 'json_schema', json_schema: MEETING_REPORT_SCHEMA },
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userContent }],
+      });
       return completion.choices[0]?.message.content;
     },
     reconcileSpeakers: async (transcriptText, speakerLabels) => {
@@ -304,7 +316,7 @@ export async function checkFfmpegAvailable(): Promise<boolean> {
     process.once('close', (code) => resolve(code === 0));
   });
 }
-function chunkSequence(file: string): number { return Number(file.match(/-(\d+)\.webm$/i)?.[1] ?? 0); }
+export function chunkSequence(file: string): number { return Number(file.match(/-(\d+)\.webm$/i)?.[1] ?? 0); }
 async function mapWithConcurrency<T, R>(values: T[], concurrency: number, transform: (value: T) => Promise<R>): Promise<R[]> {
   const results: R[] = new Array(values.length);
   let next = 0;

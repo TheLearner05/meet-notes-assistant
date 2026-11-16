@@ -5,7 +5,7 @@ import { extname, join, resolve } from 'node:path';
 import OpenAI from 'openai';
 import { isStaleRecording, MeetingStore, type MeetingLanguage } from './meeting-store.js';
 import { KnownSpeakerStore } from './known-speakers.js';
-import { checkFfmpegAvailable, processFinalDiarizedMeeting, processProvisionalMeeting, reportAsMarkdown } from './reporting.js';
+import { checkFfmpegAvailable, chunkSequence, processFinalDiarizedMeeting, processProvisionalMeeting, reportAsMarkdown } from './reporting.js';
 import { ProvisionalTranscriptionQueue } from './provisional-transcription.js';
 import { exportMeetingToGoogleDoc, googleAuthorizationUrl, saveGoogleCode } from './google-docs.js';
 import { openAiLanguageCode, openAiVocabulary, transcriptionPrompt } from './transcription-config.js';
@@ -78,9 +78,10 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
   if (request.method === 'GET' && path === '/api/meetings') { sendJson(response, 200, await store.list(url.searchParams.get('q') ?? '')); return; }
   if (request.method === 'GET' && path === '/api/known-speakers') { sendJson(response, 200, await knownSpeakers.list()); return; }
   if (request.method === 'POST' && path === '/api/meetings') {
-    const body = await readJson<{ language?: MeetingLanguage }>(request);
+    const body = await readJson<{ language?: MeetingLanguage; title?: string }>(request);
     const language = ['hi-en', 'mr-en', 'en', 'auto'].includes(body.language ?? '') ? body.language as MeetingLanguage : 'auto';
-    sendJson(response, 201, await store.create(language)); return;
+    const title = typeof body.title === 'string' && body.title.trim() ? body.title.trim() : undefined;
+    sendJson(response, 201, await store.create(language, title)); return;
   }
 
   const chunkMatch = path.match(/^\/api\/meetings\/([a-z0-9-]+)\/chunks\/(\d+)$/i);
@@ -92,9 +93,36 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
 
   const finishMatch = path.match(/^\/api\/meetings\/([a-z0-9-]+)\/finish$/i);
   if (request.method === 'POST' && finishMatch) {
-    const body = await readJson<{ manual?: boolean }>(request);
+    const body = await readJson<{ manual?: boolean; userNotes?: string }>(request);
+    if (typeof body.userNotes === 'string' && body.userNotes.trim()) {
+      await store.update(finishMatch[1], (item) => {
+        item.userNotes = body.userNotes!.trim();
+      });
+    }
     const meeting = await queueProcessing(finishMatch[1], body.manual ? 'manual' : undefined);
     sendJson(response, 202, { id: meeting.id, status: 'processing' }); return;
+  }
+
+  const audioMatch = path.match(/^\/api\/meetings\/([a-z0-9-]+)\/audio$/i);
+  if (request.method === 'GET' && audioMatch) {
+    const meeting = await requireMeeting(audioMatch[1]);
+    if (!meeting.audioChunks.length) {
+      sendJson(response, 404, { error: 'Audio is no longer available for this meeting' });
+      return;
+    }
+    const chunks = await Promise.all(
+      [...meeting.audioChunks]
+        .sort((left, right) => chunkSequence(left) - chunkSequence(right))
+        .map((file) => readFile(store.audioFile(file)))
+    );
+    const buffer = Buffer.concat(chunks);
+    response.writeHead(200, {
+      'Content-Type': 'audio/webm',
+      'Content-Length': buffer.length,
+      'Accept-Ranges': 'bytes',
+    });
+    response.end(buffer);
+    return;
   }
 
   const retryMatch = path.match(/^\/api\/meetings\/([a-z0-9-]+)\/retry$/i);

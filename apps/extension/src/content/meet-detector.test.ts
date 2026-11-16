@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getMeetState, getParticipantCount, mayStartRecording } from './meet-detector.js';
+import { getMeetingTitle, getMeetState, getParticipantCount, mayStartRecording } from './meet-detector.js';
 
 const liveCallDocument = {
   querySelector: (selector: string) =>
@@ -55,5 +55,54 @@ describe('getParticipantCount', () => {
     const document = { querySelector: () => null } as unknown as Document;
 
     expect(getParticipantCount(document)).toBeUndefined();
+  });
+});
+
+describe('getMeetingTitle', () => {
+  it('reads the title from data-meeting-title attribute when present', () => {
+    const document = {
+      querySelector: (selector: string) =>
+        selector === '[data-meeting-title]' ? { getAttribute: (attr: string) => (attr === 'data-meeting-title' ? 'Sprint Planning' : null) } : null,
+      title: 'Meet - abc-defg-hij',
+    } as unknown as Document;
+
+    expect(getMeetingTitle('https://meet.google.com/abc-defg-hij', document)).toBe('Sprint Planning');
+  });
+
+  it('reads the title from .u6vdEc DOM element', () => {
+    const document = {
+      querySelector: (selector: string) =>
+        selector.includes('.u6vdEc') ? { textContent: 'Design Review' } : null,
+      title: 'Meet',
+    } as unknown as Document;
+
+    expect(getMeetingTitle('https://meet.google.com/abc-defg-hij', document)).toBe('Design Review');
+  });
+
+  it('reads the title from document.title pattern', () => {
+    const document = {
+      querySelector: () => null,
+      title: 'Meet - Marketing Roadmap - Google Chrome',
+    } as unknown as Document;
+
+    expect(getMeetingTitle('https://meet.google.com/abc-defg-hij', document)).toBe('Marketing Roadmap');
+  });
+
+  it('falls back to the meeting code from URL when document title has no custom name', () => {
+    const document = {
+      querySelector: () => null,
+      title: 'Google Meet',
+    } as unknown as Document;
+
+    expect(getMeetingTitle('https://meet.google.com/abc-defg-hij', document)).toBe('abc-defg-hij');
+  });
+
+  it('returns undefined for non-meeting URLs', () => {
+    const document = {
+      querySelector: () => null,
+      title: 'Example',
+    } as unknown as Document;
+
+    expect(getMeetingTitle('https://example.com/other', document)).toBeUndefined();
   });
 });

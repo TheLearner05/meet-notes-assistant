@@ -15,8 +15,8 @@ const ensureOffscreenDocument = createOffscreenDocumentEnsurer({
   createOffscreenDocument() {
     return chrome.offscreen.createDocument({
       url: OFFSCREEN_DOCUMENT_PATH,
-      reasons: [chrome.offscreen.Reason.USER_MEDIA],
-      justification: 'Capture Google Meet audio after the user explicitly starts recording.',
+      reasons: [chrome.offscreen.Reason.USER_MEDIA, chrome.offscreen.Reason.AUDIO_PLAYBACK],
+      justification: 'Capture and mix Google Meet audio after the user explicitly starts recording.',
     });
   },
 });
@@ -40,7 +40,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (shouldReleaseRecordingForNewStart(await getMeetState(existingTabId))) await stopRecording(existingTabId);
           else throw new Error('Stop the current recording before starting another one.');
         }
-        const created = await fetch(`${BACKEND_URL}/api/meetings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ language: message.language }) });
+        const meetInfo = await getMeetInfo(tabId);
+        const created = await fetch(`${BACKEND_URL}/api/meetings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            language: message.language,
+            title: meetInfo?.title,
+          }),
+        });
         if (!created.ok) throw new Error('Meet Notes server is not running');
         const meeting = await created.json() as { id: string };
         await controller.start({ tabId, explicitUserClick: true });
@@ -54,7 +62,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'STOP_RECORDING') {
-    void (async () => { await stopRecording(message.tabId as number | undefined ?? sender.tab?.id); sendResponse({ ok: true }); })();
+    void (async () => {
+      await stopRecording(message.tabId as number | undefined ?? sender.tab?.id, message.userNotes as string | undefined);
+      sendResponse({ ok: true });
+    })();
     return true;
   }
   if (message.type === 'PAUSE_RECORDING') {
@@ -81,7 +92,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })();
     return true;
   }
-  if (message.type === 'MEETING_ENDED') { void stopRecording(sender.tab?.id); }
+  if (message.type === 'MEETING_ENDED') {
+    void stopRecording(sender.tab?.id, message.userNotes as string | undefined);
+  }
   if (message.type === 'GET_RECORDING_STATE') {
     void (async () => {
       const tabId = sender.tab?.id;
@@ -103,11 +116,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   })();
 });
 
-async function stopRecording(tabId: number | undefined): Promise<boolean> {
+async function stopRecording(tabId: number | undefined, userNotes?: string): Promise<boolean> {
   if (tabId === undefined || !await recordingSession.stop(tabId)) return false;
   const activeTabId = tabId;
   streamIds.delete(activeTabId);
-  chrome.runtime.sendMessage({ type: 'OFFSCREEN_STOP' });
+  chrome.runtime.sendMessage({ type: 'OFFSCREEN_STOP', userNotes });
   await chrome.action.setBadgeText({ tabId: activeTabId, text: '' });
   try { await chrome.tabs.sendMessage(activeTabId, { type: 'RECORDING_STOPPED' }); } catch { /* The tab may already be closed. */ }
   return true;
@@ -118,11 +131,15 @@ async function sendToOffscreen(message: { type: string }): Promise<{ paused?: bo
   catch { return undefined; }
 }
 
-async function getMeetState(tabId: number): Promise<'in-call' | 'lobby' | 'ended' | undefined> {
+async function getMeetInfo(tabId: number): Promise<{ state?: 'in-call' | 'lobby' | 'ended'; title?: string } | undefined> {
   try {
-    const response = await chrome.tabs.sendMessage(tabId, { type: 'GET_MEET_STATE' }) as { state?: 'in-call' | 'lobby' | 'ended' } | undefined;
-    return response?.state;
+    return await chrome.tabs.sendMessage(tabId, { type: 'GET_MEET_STATE' }) as { state?: 'in-call' | 'lobby' | 'ended'; title?: string } | undefined;
   } catch {
     return undefined;
   }
+}
+
+async function getMeetState(tabId: number): Promise<'in-call' | 'lobby' | 'ended' | undefined> {
+  const info = await getMeetInfo(tabId);
+  return info?.state;
 }
